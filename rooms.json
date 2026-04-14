@@ -1,0 +1,330 @@
+[
+  {
+    "id": "1.1",
+    "title": "Meeting Room 1.1",
+    "short_name": "1.1",
+    "capacity": 12,
+    "access_level": "yellow",
+    "restrict_daytime": false
+  },
+  {
+    "id": "1.3",
+    "title": "Meeting Room 1.3",
+    "short_name": "1.3",
+    "capacity": 12,
+    "access_level": "yellow",
+    "restrict_daytime": false
+  },
+  {
+    "id": "3.1",
+    "title": "Meeting Room 3.1",
+    "short_name": "3.1",
+    "capacity": 12,
+    "access_level": "yellow",
+    "restrict_daytime": false
+  },
+  {
+    "id": "3.2",
+    "title": "Meeting Room 3.2",
+    "short_name": "3.2",
+    "capacity": 12,
+    "access_level": "yellow",
+    "restrict_daytime": false
+  },
+  {
+    "id": "3.3",
+    "title": "Meeting Room 3.3",
+    "short_name": "3.3",
+    "capacity": 12,
+    "access_level": "yellow",
+    "restrict_daytime": false
+  },
+  {
+    "id": "3.4",
+    "title": "Meeting Room 3.4",
+    "short_name": "3.4",
+    "capacity": 12,
+    "access_level": "yellow",
+    "restrict_daytime": false
+  },
+  {
+    "id": "3.5",
+    "title": "Meeting Room 3.5",
+    "short_name": "3.5",
+    "capacity": 12,
+    "access_level": "yellow",
+    "restrict_daytime": false
+  },
+  {
+    "id": "101",
+    "title": "Lecture Room 101",
+    "short_name": "101",
+    "capacity": 32,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "102",
+    "title": "Lecture Room 102",
+    "short_name": "102",
+    "capacity": 18,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "103",
+    "title": "Lecture Room 103",
+    "short_name": "103",
+    "capacity": 21,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "104",
+    "title": "Lecture Room 104",
+    "short_name": "104",
+    "capacity": 20,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "209",
+    "title": "Lecture Room 209",
+    "short_name": "209",
+    "capacity": 36,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "301",
+    "title": "Lecture Room 301",
+    "short_name": "301",
+    "capacity": 24,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "303",
+    "title": "Lecture Room 303",
+    "short_name": "303",
+    "capacity": 30,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "304",
+    "title": "Lecture Room 304",
+    "short_name": "304",
+    "capacity": 25,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "305",
+    "title": "Lecture Room 305",
+    "short_name": "305",
+    "capacity": 25,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "312",
+    "title": "Lecture Room 312",
+    "short_name": "312",
+    "capacity": 30,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "313",
+    "title": "Lecture Room 313",
+    "short_name": "313",
+    "capacity": 60,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "314",
+    "title": "Lecture Room 314",
+    "short_name": "314",
+    "capacity": 34,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "318",
+    "title": "Lecture Room 318",
+    "short_name": "318",
+    "capacity": 30,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "320",
+    "title": "Lecture Room 320",
+    "short_name": "320",
+    "capacity": 28,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "460",
+    "title": "Lecture Room 460",
+    "short_name": "460",
+    "capacity": 30,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "461",
+    "title": "Lecture Room 461",
+    "short_name": "461",
+    "capacity": 30,
+    "access_level": "yellow",
+    "restrict_daytime": true
+  },
+  {
+    "id": "309A",
+    "title": "Clubs Room 309A",
+    "short_name": "309A",
+    "capacity": 10,
+    "access_level": "special",
+    "restrict_daytime": false
+  },
+  {
+    "id": "105",
+    "title": "Lecture Room 105",
+    "short_name": "105",
+    "capacity": 240,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "106",
+    "title": "Lecture Room 106",
+    "short_name": "106",
+    "capacity": 140,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "107",
+    "title": "Lecture Room 107",
+    "short_name": "107",
+    "capacity": 150,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "108",
+    "title": "Lecture Room 108",
+    "short_name": "108",
+    "capacity": 312,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "111",
+    "title": "Lecture Room 111",
+    "short_name": "111",
+    "capacity": 24,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "300",
+    "title": "Lecture Room 300",
+    "short_name": "300",
+    "capacity": 48,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "306",
+    "title": "Lecture Room 306",
+    "short_name": "306",
+    "capacity": 18,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "307",
+    "title": "Lecture Room 307",
+    "short_name": "307",
+    "capacity": 60,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "308",
+    "title": "Lecture Room 308",
+    "short_name": "308",
+    "capacity": 35,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "316",
+    "title": "Lecture Room 316",
+    "short_name": "316",
+    "capacity": 26,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "317",
+    "title": "Lecture Room 317",
+    "short_name": "317",
+    "capacity": 26,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "321",
+    "title": "Lecture Room 321",
+    "short_name": "321",
+    "capacity": 48,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "4.2",
+    "title": "Meeting Room 4.2",
+    "short_name": "4.2",
+    "capacity": 12,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "4.3",
+    "title": "Meeting Room 4.3",
+    "short_name": "4.3",
+    "capacity": 12,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "4.4",
+    "title": "Meeting Room 4.4",
+    "short_name": "4.4",
+    "capacity": 12,
+    "access_level": "red",
+    "restrict_daytime": false
+  },
+  {
+    "id": "4.5",
+    "title": "Meeting Room 4.5",
+    "short_name": "4.5",
+    "capacity": 12,
+    "access_level": "special",
+    "restrict_daytime": false
+  },
+  {
+    "id": "425",
+    "title": "Meeting Room 425",
+    "short_name": "425",
+    "capacity": 30,
+    "access_level": "special",
+    "restrict_daytime": false
+  }
+]

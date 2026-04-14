@@ -1,0 +1,22 @@
+[project]
+name = "schedule-assistant"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cpmpy>=0.10.0",
+    "ortools>=9.14.6206",
+    "pydantic>=2.11.5",
+    "pytest>=8.0",
+    "pyyaml>=6.0.2",
+    "tqdm>=4.67.1",
+]
+
+[project.scripts]
+config-tui = "config_tui:main"
+schedule-main = "main:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
