@@ -372,7 +372,9 @@ def solve_schedule(
         (100, 300),  # >70% oversize
     )
     room_oversize_coeffs: dict[tuple[int, int], int] = {}
+    room_under_capacity_coeffs: dict[tuple[int, int], int] = {}
     required_capacity_by_meeting: dict[int, int] = {}
+    UNDER_CAPACITY_EVENT_WEIGHT = 250
 
     # Room sizing constraints/objective terms:
     # - room under-capacity is hard-forbidden
@@ -404,8 +406,13 @@ def solve_schedule(
 
             impact = _meeting_impact(meeting.groups)
             weighted_oversize_penalty = oversize_penalty * impact
+            under_capacity_penalty = 0
+            if capacity < students:
+                # Keep fallback feasibility, but discourage under-capacity assignments.
+                under_capacity_penalty = UNDER_CAPACITY_EVENT_WEIGHT * impact
 
             room_oversize_coeffs[(i, room_idx)] = weighted_oversize_penalty
+            room_under_capacity_coeffs[(i, room_idx)] = under_capacity_penalty
 
     for i, meeting in enumerate(meetings):
         students = meeting.expected_students
@@ -422,8 +429,12 @@ def solve_schedule(
             if oversize_coeff > 0:
                 tier2_terms.append(selected_room * oversize_coeff)
 
+            under_capacity_coeff = room_under_capacity_coeffs.get((i, room_idx), 0)
+            if under_capacity_coeff > 0:
+                tier2_terms.append(selected_room * under_capacity_coeff)
+
     # Soft relation between related components of the same audience/week.
-    ORDER_VIOLATION_WEIGHT = 500
+    ORDER_VIOLATION_WEIGHT = 700
     CROSS_DAY_VIOLATION_WEIGHT = 200
     CROSS_DAY_LAB_VIOLATION_WEIGHT = 40
     BACK_TO_BACK_MISS_WEIGHT = 600
@@ -720,6 +731,30 @@ def solve_schedule(
         else:
             status = _run_solver_once()
     else:
+        # Run a short feasibility pass first to seed objective phases with a concrete schedule.
+        warm_start_share = 0.25
+        warm_remaining = deadline - time.monotonic()
+        if warm_remaining > 0:
+            warm_budget = max(0.1, min(warm_remaining, float(time_limit) * warm_start_share))
+            solver.parameters.max_time_in_seconds = warm_budget
+            if log_dir is not None:
+                warm_log_path = log_dir / "solver_log_phase_0_feasibility.txt"
+                warm_log_path.write_text("", encoding="utf-8")
+                status = _run_solver_once([warm_log_path])
+            else:
+                status = _run_solver_once()
+            if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                best_feasible_status = status
+                best_day_values = [solver.Value(v) for v in day_vars]
+                best_local_start_values = [solver.Value(v) for v in local_start_vars]
+                best_room_values = [solver.Value(v) for v in room_vars]
+                best_inst_choice_values = [solver.Value(v) for v in inst_choice_vars]
+                model.clear_hints()
+                for v in hint_int_vars:
+                    model.add_hint(v, solver.Value(v))
+                for v in hint_bool_vars:
+                    model.add_hint(v, bool(solver.Value(v)))
+
         total_phases = len(objective_phases)
         if total_phases == 1:
             phase_shares = [1.0]
