@@ -1042,6 +1042,10 @@ def main() -> None:
                 per_week = max((len(slots) for slots in slots_source.values()), default=1)
                 if per_week != 1:
                     cls["per_week"] = per_week
+                if pattern.course == "Nature Inspired Computing":
+                    # Project-specific override: keep this course at one meeting/week
+                    # for each emitted component stream.
+                    cls.pop("per_week", None)
                 if data["duration_slots"] != 1:
                     cls["duration_slots"] = data["duration_slots"]
                 if is_english_lesson(pattern.course):
@@ -1158,6 +1162,57 @@ def main() -> None:
 
                 if best is not None:
                     tut_cls["relates_to"] = best[1]
+
+        # Split lab streams across multiple lecture streams and emit relates_to.
+        # This is important for courses like Nature Inspired Computing where each
+        # lab audience corresponds to a specific lecture audience.
+        for course_name, components in list(courses_map.items()):
+            lecture_indices = [idx for idx, cls in enumerate(components) if cls.get("tag") == "lec"]
+            if len(lecture_indices) <= 1:
+                continue
+
+            def _as_set(value: Any) -> set[str]:
+                if not isinstance(value, list):
+                    return set()
+                return {str(item) for item in value if isinstance(item, str)}
+
+            rebuilt: list[dict[str, Any]] = []
+            for idx, cls in enumerate(components):
+                if cls.get("tag") != "lab" or cls.get("relates_to") is not None:
+                    rebuilt.append(cls)
+                    continue
+
+                lab_groups = _as_set(cls.get("student_groups"))
+                if not lab_groups:
+                    rebuilt.append(cls)
+                    continue
+
+                overlaps: list[tuple[int, set[str]]] = []
+                for lec_idx in lecture_indices:
+                    lec_groups = _as_set(components[lec_idx].get("student_groups"))
+                    overlap = lab_groups & lec_groups
+                    if overlap:
+                        overlaps.append((lec_idx, overlap))
+
+                if len(overlaps) <= 1:
+                    rebuilt.append(cls)
+                    continue
+
+                union_overlap: set[str] = set()
+                for _lec_idx, overlap in overlaps:
+                    union_overlap.update(overlap)
+                if union_overlap != lab_groups:
+                    rebuilt.append(cls)
+                    continue
+
+                # Build one lab component per matched lecture stream.
+                for lec_idx, overlap in overlaps:
+                    split_cls = deepcopy(cls)
+                    split_cls["student_groups"] = sorted(overlap)
+                    split_cls["relates_to"] = lec_idx
+                    rebuilt.append(split_cls)
+
+            courses_map[course_name] = rebuilt
 
         instructors = [
             {

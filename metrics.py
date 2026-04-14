@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import math
 import statistics
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import yaml
-from main import Schedule, SolveResult, teaching_dates
 
 from config import CourseConfig, ScheduleConfig, expand_groups, resolve_selector_map
+from main import Schedule, SolveResult, teaching_dates
 
 # Matches current solver (single slot index per meeting); replace when model exposes per-class duration.
 TIME_SLOT_DURATION = datetime.timedelta(minutes=90)
@@ -21,6 +22,13 @@ WEEKDAY_RANK = {day: idx for idx, day in enumerate(WEEKDAY_ORDER)}
 # Python weekday: Mon=0 .. Sun=6.
 WEEKDAYS_MON_FRI = frozenset(range(5))
 WEEKDAYS_MON_SAT = frozenset(range(6))
+LARGE_ROOM_CAPACITY_THRESHOLD = 100
+LARGE_ROOM_EXCEEDING_GAP = 0.9
+ROOM_OVERSIZE_PCT_THRESHOLD = 30
+LATE_SLOT_COUNT = 2
+BAD_DAY_EVENT_THRESHOLD = 5
+BAD_DAY_DISTINCT_SUBJECTS_THRESHOLD = 3
+MIN_INSTRUCTOR_WEEK_LOAD = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +61,7 @@ class ScheduleMetrics:
     events_exceeding_room_capacity: tuple[RoomCapacityViolation, ...]
     events_with_room_much_larger_than_students_count: int
     events_with_room_much_larger_than_students: tuple[RoomOversizeViolation, ...]
+    space_inefficiency_wasted_seat_hours: float
     events: tuple[FlatMeeting, ...]
     labs_before_tutorial_events: tuple[TagOrderPair, ...]
     labs_before_lecture_events: tuple[TagOrderPair, ...]
@@ -73,10 +82,9 @@ class ScheduleMetrics:
     instructor_weekday_load: dict[str, dict[str, int]]
     events_per_course_component: dict[str, int]
     events_per_course_components_grouped: dict[str, dict[str, int]]
-    room_swaps_instructor_consecutive_slots: int
-    room_swaps_group_consecutive_slots: int
-    room_swaps_same_instructor_and_audience_consecutive_slots: int
-    room_swaps_same_course_and_audience_consecutive_slots: int
+    room_swaps_tutorial_lecture_same_course_audience: int
+    room_swaps_consecutive_labs_same_group: int
+    room_swaps_consecutive_labs_same_group_same_instructor: int
 
     @property
     def has_conflicts(self) -> bool:
@@ -112,69 +120,50 @@ def _is_consecutive_time_slots(
     return i2 == i1 + 1
 
 
-def _room_swaps_consecutive_slots_instructor(events: list[FlatMeeting], time_slots: list[datetime.time]) -> int:
-    """Count transitions where an instructor is in room A, then in the next slot in room B (B != A)."""
-    by_inst_day: dict[tuple[str, datetime.date], list[FlatMeeting]] = defaultdict(list)
-    for e in events:
-        for inst in e.instructors:
-            by_inst_day[(inst, e.date)].append(e)
-    total = 0
-    for _key, evs in by_inst_day.items():
-        evs.sort(key=lambda x: x.start_time)
-        for a, b in zip(evs, evs[1:]):
-            if _is_consecutive_time_slots(a, b, time_slots) and a.room != b.room:
-                total += 1
-    return total
-
-
-def _room_swaps_consecutive_slots_group(events: list[FlatMeeting], time_slots: list[datetime.time]) -> int:
-    """Per student group: count transitions from room A to room B on the next time slot."""
-    by_group_day: dict[tuple[str, datetime.date], list[FlatMeeting]] = defaultdict(list)
-    for e in events:
-        for g in e.groups:
-            by_group_day[(g, e.date)].append(e)
-    total = 0
-    for _key, evs in by_group_day.items():
-        evs.sort(key=lambda x: x.start_time)
-        for a, b in zip(evs, evs[1:]):
-            if _is_consecutive_time_slots(a, b, time_slots) and a.room != b.room:
-                total += 1
-    return total
-
-
-def _room_swaps_consecutive_slots_same_instructor_and_audience(
+def _room_swaps_tutorial_lecture_same_course_audience(
     events: list[FlatMeeting], time_slots: list[datetime.time]
 ) -> int:
-    """
-    Same instructor set and same audience (groups) on consecutive slots but different rooms —
-    cohort moves together but must relocate.
-    """
-    by_key: dict[tuple[datetime.date, tuple[str, ...], tuple[str, ...]], list[FlatMeeting]] = defaultdict(list)
-    for e in events:
-        by_key[(e.date, e.instructors, e.groups)].append(e)
-    total = 0
-    for _key, evs in by_key.items():
-        evs.sort(key=lambda x: x.start_time)
-        for a, b in zip(evs, evs[1:]):
-            if _is_consecutive_time_slots(a, b, time_slots) and a.room != b.room:
-                total += 1
-    return total
-
-
-def _room_swaps_consecutive_slots_same_course_and_audience(
-    events: list[FlatMeeting], time_slots: list[datetime.time]
-) -> int:
-    """Same course and same audience (groups) on consecutive slots but different rooms (e.g. lec then tut)."""
+    """Tutorial<->lecture in consecutive slots for same course+audience but in different rooms."""
     by_key: dict[tuple[datetime.date, str, tuple[str, ...]], list[FlatMeeting]] = defaultdict(list)
     for e in events:
+        if str(e.component_tag).lower() not in {"lec", "tut"}:
+            continue
         by_key[(e.date, e.course, e.groups)].append(e)
     total = 0
     for _key, evs in by_key.items():
         evs.sort(key=lambda x: x.start_time)
         for a, b in zip(evs, evs[1:]):
-            if _is_consecutive_time_slots(a, b, time_slots) and a.room != b.room:
+            a_tag = str(a.component_tag).lower()
+            b_tag = str(b.component_tag).lower()
+            is_tut_lec_pair = (a_tag == "tut" and b_tag == "lec") or (a_tag == "lec" and b_tag == "tut")
+            if is_tut_lec_pair and _is_consecutive_time_slots(a, b, time_slots) and a.room != b.room:
                 total += 1
     return total
+
+
+def _room_swaps_consecutive_labs_same_group(
+    events: list[FlatMeeting], time_slots: list[datetime.time]
+) -> tuple[int, int]:
+    """
+    Consecutive lab->lab transitions for the same group where room changes.
+    Returns: (all such swaps, swaps where instructor set is also the same).
+    """
+    by_group_day: dict[tuple[str, datetime.date], list[FlatMeeting]] = defaultdict(list)
+    for e in events:
+        if str(e.component_tag).lower() != "lab":
+            continue
+        for g in e.groups:
+            by_group_day[(g, e.date)].append(e)
+    total = 0
+    same_instructor_total = 0
+    for _key, evs in by_group_day.items():
+        evs.sort(key=lambda x: x.start_time)
+        for a, b in zip(evs, evs[1:]):
+            if _is_consecutive_time_slots(a, b, time_slots) and a.room != b.room:
+                total += 1
+                if set(a.instructors) == set(b.instructors):
+                    same_instructor_total += 1
+    return total, same_instructor_total
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,7 +328,9 @@ def _ordered_group_dict[T](mapping: dict[str, T], cfg: ScheduleConfig) -> dict[s
     return {gid: mapping[gid] for gid in _sort_group_ids(mapping.keys(), cfg)}
 
 
-def _meeting_expected_students(comp_cfg: CourseConfig.Component, groups: tuple[str, ...], group_sizes: dict[str, int]) -> int:
+def _meeting_expected_students(
+    comp_cfg: CourseConfig.Component, groups: tuple[str, ...], group_sizes: dict[str, int]
+) -> int:
     if comp_cfg.expected_enrollment is not None:
         return max(0, int(comp_cfg.expected_enrollment))
     return max(0, sum(group_sizes.get(group_id, 0) for group_id in groups))
@@ -360,9 +351,11 @@ def _back_to_back_lecture_tutorial_opportunities(cfg: ScheduleConfig) -> int:
             for src_idx in rel_indices:
                 if 0 <= src_idx < ncomp and src_idx != dst_idx:
                     explicit_relations.add((src_idx, dst_idx))
-        component_relations = sorted(explicit_relations) if explicit_relations else [
-            (cls_idx, cls_idx + 1) for cls_idx in range(ncomp - 1)
-        ]
+        component_relations = (
+            sorted(explicit_relations)
+            if explicit_relations
+            else [(cls_idx, cls_idx + 1) for cls_idx in range(ncomp - 1)]
+        )
         for src_idx, dst_idx in component_relations:
             src = course.components[src_idx]
             dst = course.components[dst_idx]
@@ -499,8 +492,40 @@ def _same_day_lec_tut_lab_satisfied(events: list[FlatMeeting], cfg: ScheduleConf
     return len(satisfied_weeks)
 
 
+def _component_relation_allows_pair(
+    cfg: ScheduleConfig,
+    course_idx: int,
+    early_component_idx: int,
+    late_component_idx: int,
+) -> bool:
+    components = cfg.courses[course_idx].components if 0 <= course_idx < len(cfg.courses) else []
+    if (
+        early_component_idx < 0
+        or late_component_idx < 0
+        or early_component_idx >= len(components)
+        or late_component_idx >= len(components)
+    ):
+        return False
+    early_comp = components[early_component_idx]
+    late_comp = components[late_component_idx]
+
+    def _rels(comp: CourseConfig.Component) -> set[int]:
+        raw = comp.relates_to
+        if raw is None:
+            return set()
+        if isinstance(raw, list):
+            return {int(v) for v in raw}
+        return {int(raw)}
+
+    early_rels = _rels(early_comp)
+    late_rels = _rels(late_comp)
+    if not early_rels and not late_rels:
+        return True
+    return (late_component_idx in early_rels) or (early_component_idx in late_rels)
+
+
 def _collect_tag_before_tag_debug_events(
-    events: list[FlatMeeting], early_tag: str, late_tag: str
+    events: list[FlatMeeting], cfg: ScheduleConfig, early_tag: str, late_tag: str
 ) -> list[TagOrderPair]:
     """Pairs where early_tag starts strictly before late_tag in wall-clock time (same course, shared group)."""
     pairs: list[TagOrderPair] = []
@@ -519,6 +544,10 @@ def _collect_tag_before_tag_debug_events(
             for late_event in late_events:
                 late_dt = datetime.datetime.combine(late_event.date, late_event.start_time)
                 if early_dt >= late_dt:
+                    continue
+                if not _component_relation_allows_pair(
+                    cfg, course_idx, early_event.component_idx, late_event.component_idx
+                ):
                     continue
                 shared_groups = tuple(sorted(set(early_event.groups) & set(late_event.groups)))
                 if not shared_groups:
@@ -617,7 +646,9 @@ def _expected_audience_meeting_counts(cfg: ScheduleConfig) -> dict[tuple[str, st
     return out
 
 
-def _actual_audience_meeting_counts(schedule: Schedule, cfg: ScheduleConfig) -> dict[tuple[str, str, tuple[str, ...]], int]:
+def _actual_audience_meeting_counts(
+    schedule: Schedule, cfg: ScheduleConfig
+) -> dict[tuple[str, str, tuple[str, ...]], int]:
     out: dict[tuple[str, str, tuple[str, ...]], int] = {}
     for csched in schedule.courses:
         for comp_out in csched.components:
@@ -676,6 +707,7 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
     room_used_slots: dict[str, set[tuple[datetime.date, datetime.time]]] = defaultdict(set)
     capacity_violations: list[RoomCapacityViolation] = []
     oversize_violations: list[RoomOversizeViolation] = []
+    wasted_seat_hours = 0.0
 
     for e in events:
         weekday = _weekday_name(e.date)
@@ -699,10 +731,19 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         room_used_slots[e.room].add((e.date, e.start_time))
         room_capacity = room_capacity_map.get(e.room, 0)
         room_capacity_total[e.room] += room_capacity
-        comp_cfg = cfg.courses[e.course_idx].components[e.component_idx] if e.course_idx < len(cfg.courses) and e.component_idx < len(cfg.courses[e.course_idx].components) else None
+        comp_cfg = (
+            cfg.courses[e.course_idx].components[e.component_idx]
+            if e.course_idx < len(cfg.courses) and e.component_idx < len(cfg.courses[e.course_idx].components)
+            else None
+        )
         expected_students = _meeting_expected_students(comp_cfg, e.groups, group_sizes) if comp_cfg is not None else 0
         room_students_total[e.room] += expected_students
-        if expected_students > room_capacity:
+        wasted_seat_hours += max(0, room_capacity - expected_students) * event_hours
+        allowed_capacity = room_capacity
+        if room_capacity > LARGE_ROOM_CAPACITY_THRESHOLD:
+            # For large rooms, allow a 0.9-gap tolerance before flagging over-capacity.
+            allowed_capacity = math.ceil(room_capacity / LARGE_ROOM_EXCEEDING_GAP)
+        if expected_students > allowed_capacity:
             capacity_violations.append(
                 RoomCapacityViolation(
                     event=e,
@@ -715,7 +756,7 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         required_capacity = max(1, required_capacity)
         if room_capacity > required_capacity:
             oversize_pct = ((room_capacity - required_capacity) * 100) // max(1, required_capacity)
-            if oversize_pct > 30:
+            if oversize_pct > ROOM_OVERSIZE_PCT_THRESHOLD:
                 oversize_violations.append(
                     RoomOversizeViolation(
                         event=e,
@@ -732,18 +773,22 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         room_capacity_utilization_by_room[room_id] = (room_students_total.get(room_id, 0) / denom) if denom > 0 else 0.0
 
     total_capacity_denom = sum(room_capacity_total.values())
-    room_capacity_utilization_overall = (sum(room_students_total.values()) / total_capacity_denom) if total_capacity_denom > 0 else 0.0
+    room_capacity_utilization_overall = (
+        (sum(room_students_total.values()) / total_capacity_denom) if total_capacity_denom > 0 else 0.0
+    )
 
     room_time_utilization_by_room: dict[str, float] = {}
     for room_id in room_capacity_map:
         used = len(room_used_slots.get(room_id, set()))
-        room_time_utilization_by_room[room_id] = (used / available_slots_per_room) if available_slots_per_room > 0 else 0.0
+        room_time_utilization_by_room[room_id] = (
+            (used / available_slots_per_room) if available_slots_per_room > 0 else 0.0
+        )
     total_used_slots = sum(len(v) for v in room_used_slots.values())
     total_available_slots = available_slots_per_room * len(room_capacity_map)
     room_time_utilization_overall = (total_used_slots / total_available_slots) if total_available_slots > 0 else 0.0
-    labs_before_tutorial_events = _collect_tag_before_tag_debug_events(events, "lab", "tut")
-    labs_before_lecture_events = _collect_tag_before_tag_debug_events(events, "lab", "lec")
-    tutorials_before_lecture_events = _collect_tag_before_tag_debug_events(events, "tut", "lec")
+    labs_before_tutorial_events = _collect_tag_before_tag_debug_events(events, cfg, "lab", "tut")
+    labs_before_lecture_events = _collect_tag_before_tag_debug_events(events, cfg, "lab", "lec")
+    tutorials_before_lecture_events = _collect_tag_before_tag_debug_events(events, cfg, "tut", "lec")
     events_per_course_components_grouped: dict[str, dict[str, int]] = {}
 
     for course_cfg in cfg.courses:
@@ -755,8 +800,7 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         events_per_course_components_grouped[course_cfg.name] = grouped_components
 
     cfg_course_tags: dict[str, set[str]] = {
-        course_cfg.name: {str(comp_cfg.tag) for comp_cfg in course_cfg.components}
-        for course_cfg in cfg.courses
+        course_cfg.name: {str(comp_cfg.tag) for comp_cfg in course_cfg.components} for course_cfg in cfg.courses
     }
     for key, count in events_per_course_component.items():
         course_name, component_tag = key.split("/", 1)
@@ -786,15 +830,9 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
     per_group_saturday_nonempty = {g: c for g, c in per_group_saturday_events.items() if c > 0}
 
     time_slots = cfg.term.time_slots
-    room_swaps_inst = (
-        _room_swaps_consecutive_slots_instructor(events, time_slots) if events else 0
-    )
-    room_swaps_grp = _room_swaps_consecutive_slots_group(events, time_slots) if events else 0
-    room_swaps_joint = (
-        _room_swaps_consecutive_slots_same_instructor_and_audience(events, time_slots) if events else 0
-    )
-    room_swaps_course_aud = (
-        _room_swaps_consecutive_slots_same_course_and_audience(events, time_slots) if events else 0
+    room_swaps_tut_lec = _room_swaps_tutorial_lecture_same_course_audience(events, time_slots) if events else 0
+    room_swaps_labs_group, room_swaps_labs_group_same_inst = (
+        _room_swaps_consecutive_labs_same_group(events, time_slots) if events else (0, 0)
     )
 
     return ScheduleMetrics(
@@ -813,6 +851,7 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         events_exceeding_room_capacity=tuple(capacity_violations),
         events_with_room_much_larger_than_students_count=len(oversize_violations),
         events_with_room_much_larger_than_students=tuple(oversize_violations),
+        space_inefficiency_wasted_seat_hours=wasted_seat_hours,
         events=tuple(events),
         labs_before_tutorial_events=tuple(labs_before_tutorial_events),
         labs_before_lecture_events=tuple(labs_before_lecture_events),
@@ -828,8 +867,7 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         saturday_event_count=saturday_event_count,
         per_group_saturday_events=_ordered_group_dict(per_group_saturday_nonempty, cfg),
         timeslot_histogram_by_weekday={
-            weekday: dict(sorted(hist.items()))
-            for weekday, hist in sorted(timeslot_histogram_by_weekday.items())
+            weekday: dict(sorted(hist.items())) for weekday, hist in sorted(timeslot_histogram_by_weekday.items())
         },
         meeting_hours_weighted_by_group_count_per_weekday=dict(
             _sort_weekday_items(list(meeting_hours_weighted_by_group_count_per_weekday.items()))
@@ -839,15 +877,13 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         room_time_utilization_by_room=dict(sorted(room_time_utilization_by_room.items())),
         room_time_utilization_overall=room_time_utilization_overall,
         instructor_weekday_load={
-            inst: dict(sorted(load.items()))
-            for inst, load in sorted(instructor_weekday_load.items())
+            inst: dict(sorted(load.items())) for inst, load in sorted(instructor_weekday_load.items())
         },
         events_per_course_component=dict(sorted(events_per_course_component.items())),
         events_per_course_components_grouped=events_per_course_components_grouped,
-        room_swaps_instructor_consecutive_slots=room_swaps_inst,
-        room_swaps_group_consecutive_slots=room_swaps_grp,
-        room_swaps_same_instructor_and_audience_consecutive_slots=room_swaps_joint,
-        room_swaps_same_course_and_audience_consecutive_slots=room_swaps_course_aud,
+        room_swaps_tutorial_lecture_same_course_audience=room_swaps_tut_lec,
+        room_swaps_consecutive_labs_same_group=room_swaps_labs_group,
+        room_swaps_consecutive_labs_same_group_same_instructor=room_swaps_labs_group_same_inst,
     )
 
 
@@ -906,98 +942,146 @@ def _avg_distinct_courses_by_weekday_label(per_group: dict[str, dict[str, int]])
     return {wd: statistics.mean(vals) for wd, vals in buckets.items()}
 
 
-def _print_human_report(metrics: ScheduleMetrics, cfg: ScheduleConfig) -> None:
+def _print_human_report(
+    metrics: ScheduleMetrics, cfg: ScheduleConfig, solution_status: str, short: bool = False
+) -> None:
     total_weighted_group_hours = sum(metrics.meeting_hours_weighted_by_group_count_per_weekday.values())
     total_capacity_overflow_students = sum(
         max(0, violation.expected_students - violation.room_capacity)
         for violation in metrics.events_exceeding_room_capacity
     )
+    selector_map = resolve_selector_map(cfg)
+    core_course_indices = {
+        idx
+        for idx, course_cfg in enumerate(cfg.courses)
+        if "core_course" in {str(tag).lower() for tag in course_cfg.course_tags}
+    }
+    core_events = [e for e in metrics.events if e.course_idx in core_course_indices]
+    late_slots = (
+        set(cfg.term.time_slots[-LATE_SLOT_COUNT:])
+        if len(cfg.term.time_slots) >= LATE_SLOT_COUNT
+        else set(cfg.term.time_slots)
+    )
+    late_events_count = sum(1 for e in metrics.events if e.start_time in late_slots)
+    core_events_per_group_day: dict[tuple[str, datetime.date], int] = defaultdict(int)
+    core_distinct_subjects_per_group_day_sets: dict[tuple[str, datetime.date], set[str]] = defaultdict(set)
+    core_courses_by_group: dict[str, set[str]] = defaultdict(set)
+    per_group_weekday_load: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for e in core_events:
+        for g in e.groups:
+            core_events_per_group_day[(g, e.date)] += 1
+            core_distinct_subjects_per_group_day_sets[(g, e.date)].add(e.course)
+            core_courses_by_group[g].add(e.course)
+    for e in metrics.events:
+        for g in e.groups:
+            per_group_weekday_load[g][e.date.strftime("%a")] += 1
+    core_per_group_distinct_subjects: dict[str, dict[str, int]] = defaultdict(dict)
+    for (g, d), subjects in core_distinct_subjects_per_group_day_sets.items():
+        core_per_group_distinct_subjects[g][d.isoformat()] = len(subjects)
+    bad_days_events_by_group: dict[str, int] = defaultdict(int)
+    bad_days_distinct_by_group: dict[str, int] = defaultdict(int)
+    core_group_ids = set(core_per_group_distinct_subjects)
+    core_group_ids.update(g for g, _ in core_events_per_group_day)
+    for group_id in core_group_ids:
+        day_isos = set(core_per_group_distinct_subjects.get(group_id, {}))
+        day_isos.update(d.isoformat() for g, d in core_events_per_group_day if g == group_id)
+        for day_iso in day_isos:
+            day = datetime.date.fromisoformat(day_iso)
+            ev_n = core_events_per_group_day.get((group_id, day), 0)
+            distinct_n = core_per_group_distinct_subjects.get(group_id, {}).get(day_iso, 0)
+            if ev_n > BAD_DAY_EVENT_THRESHOLD:
+                bad_days_events_by_group[group_id] += 1
+            if distinct_n > BAD_DAY_DISTINCT_SUBJECTS_THRESHOLD:
+                bad_days_distinct_by_group[group_id] += 1
+    bad_days_events_total = sum(bad_days_events_by_group.values())
+    bad_days_distinct_total = sum(bad_days_distinct_by_group.values())
+    groups_with_bad_days_events = sum(1 for n in bad_days_events_by_group.values() if n > 0)
+    groups_with_bad_days_distinct = sum(1 for n in bad_days_distinct_by_group.values() if n > 0)
+    total_groups_count = len(core_group_ids)
+    groups_with_gt1_total_courses = sum(1 for group_id in core_group_ids if len(core_courses_by_group.get(group_id, set())) > 1)
+    groups_with_gt2_total_courses = sum(1 for group_id in core_group_ids if len(core_courses_by_group.get(group_id, set())) > 2)
 
     print("=== Schedule Metrics ===")
-    print(f"Total events: {metrics.total_events}")
-    print(f"Total timeslots count: {metrics.total_timeslots_count}")
+    print("Context / dataset:")
+    print(f"- solution status: {solution_status}")
+    print(f"- total scheduled events: {metrics.total_events}")
+    print(f"- total available timeslots (teaching days x day slots): {metrics.total_timeslots_count}")
+    print(f"- total meeting hours weighted by group count: {total_weighted_group_hours:.1f}")
+    print(f"- total core-course groups count: {total_groups_count}")
     print(
-        "Room swaps on consecutive time slots (less is better): "
-        f"instructor={metrics.room_swaps_instructor_consecutive_slots}, "
-        f"group={metrics.room_swaps_group_consecutive_slots}, "
-        f"same instructor+audience={metrics.room_swaps_same_instructor_and_audience_consecutive_slots}, "
-        f"same course+audience={metrics.room_swaps_same_course_and_audience_consecutive_slots}"
+        "- core-course groups with >1 total distinct course in schedule: "
+        f"{groups_with_gt1_total_courses}"
     )
-    print(f"Total meeting hours weighted by group count: {total_weighted_group_hours:.1f}")
     print(
-        "Back-to-back lec->tut (more is better): "
+        "- core-course groups with >2 total distinct courses in schedule: "
+        f"{groups_with_gt2_total_courses}"
+    )
+    print("---")
+    print("Metrics:")
+    print(f"- hard conflicts (should be 0): {len(metrics.conflicts)}")
+    print(f"- unsatisfied constraints (should be 0): {len(metrics.unsatisfied)}")
+    print(
+        "- back-to-back lec->tut coverage (higher is better): "
         f"{metrics.back_to_back_lecture_tutorial_scheduled}/"
         f"{metrics.back_to_back_lecture_tutorial_opportunities}"
     )
     print(
-        "Same calendar day lec+tut+lab (more is better): "
-        f"{metrics.same_day_lec_tut_lab_satisfied}/{metrics.same_day_lec_tut_lab_opportunities} "
-        "(per course×group×term-week with all three on one day; lec/tut may be program-wide, lab per group)"
+        "- lec+tut+lab on same-day coverage (higher is better): "
+        f"{metrics.same_day_lec_tut_lab_satisfied}/{metrics.same_day_lec_tut_lab_opportunities}"
     )
     print(
-        "Labs before tutorial or lecture in time (less is better): "
-        f"{metrics.labs_before_tutorial_count} before tutorial, "
-        f"{metrics.labs_before_lecture_count} before lecture"
+        "- wrong component order counts (lower is better):\n"
+        f"  - labs-before-tutorial={metrics.labs_before_tutorial_count}\n"
+        f"  - labs-before-lecture={metrics.labs_before_lecture_count}\n"
+        f"  - tutorials-before-lecture={metrics.tutorials_before_lecture_count}"
     )
-    print(f"Tutorials before lecture in time (less is better): {metrics.tutorials_before_lecture_count}")
-    print(f"Events exceeding room capacity (less is better): {metrics.events_exceeding_room_capacity_count}")
     print(
-        "Events with room much larger than students (less is better): "
-        f"{metrics.events_with_room_much_larger_than_students_count}"
+        "- room capacity violations (lower is better):\n"
+        f"  - undersized-room events={metrics.events_exceeding_room_capacity_count}\n"
+        f"  - oversized-room events={metrics.events_with_room_much_larger_than_students_count}\n"
+        f"  - overflow students={total_capacity_overflow_students}\n"
+        f"  - space inefficiency: wasted seats x hours={metrics.space_inefficiency_wasted_seat_hours:.1f}"
     )
-    print(f"Total capacity overflow students (less is better): {total_capacity_overflow_students}")
-    print(f"Conflicts (less is better): {len(metrics.conflicts)}")
-    print(f"Unsatisfied items (less is better): {len(metrics.unsatisfied)}")
-    print(f"Overall room capacity utilization: {metrics.room_capacity_utilization_overall:.3f}")
-    print(f"Overall room time utilization: {metrics.room_time_utilization_overall:.3f}")
-    _mf_distinct_counts = _collect_distinct_counts_for_groups(
-        metrics.per_group_per_day_distinct_subjects, None
+    print(
+        "- room swaps, moving between rooms (lower is better):\n"
+        f"  - from lecture->tutorial with same course and audience requires room swap={metrics.room_swaps_tutorial_lecture_same_course_audience}\n"
+        f"  - from lab->lab with same group requires room swap={metrics.room_swaps_consecutive_labs_same_group}\n"
+        f"  - from lab->lab with same group and same instructor requires room swap={metrics.room_swaps_consecutive_labs_same_group_same_instructor}"
     )
+    print(
+        "- schedule hatred (lower is better):\n"
+        f"  - bad days when more than {BAD_DAY_EVENT_THRESHOLD} events={bad_days_events_total}\n"
+        f"  - groups with >=1 bad_day by events={groups_with_bad_days_events}\n"
+        f"  - bad days when more than {BAD_DAY_DISTINCT_SUBJECTS_THRESHOLD} distinct subjects={bad_days_distinct_total}\n"
+        f"  - groups with >=1 bad_day by distinct subjects={groups_with_bad_days_distinct}\n"
+        f"  - saturday events={metrics.saturday_event_count}\n"
+        f"  - late-slot events={late_events_count} (last {LATE_SLOT_COUNT} timeslots of day)"
+    )
+
+    print("======\n")
+    if short:
+        return
+    _mf_distinct_counts = _collect_distinct_counts_for_groups(core_per_group_distinct_subjects, None)
     _n_mf_days = len(_mf_distinct_counts)
-    _avg_distinct_courses_mf = (
-        metrics.distinct_subjects_per_group_day_sum / _n_mf_days if _n_mf_days else 0.0
-    )
+    _avg_distinct_courses_mf = (sum(_mf_distinct_counts) / _n_mf_days) if _n_mf_days else 0.0
     _median_distinct_mf = statistics.median(_mf_distinct_counts) if _mf_distinct_counts else 0.0
     _pct_one_course = (
-        100.0 * sum(1 for x in _mf_distinct_counts if x == 1) / len(_mf_distinct_counts)
-        if _mf_distinct_counts
-        else 0.0
+        100.0 * sum(1 for x in _mf_distinct_counts if x == 1) / len(_mf_distinct_counts) if _mf_distinct_counts else 0.0
     )
     _pct_two_courses = (
-        100.0 * sum(1 for x in _mf_distinct_counts if x == 2) / len(_mf_distinct_counts)
-        if _mf_distinct_counts
-        else 0.0
+        100.0 * sum(1 for x in _mf_distinct_counts if x == 2) / len(_mf_distinct_counts) if _mf_distinct_counts else 0.0
     )
     print(
         "All cohorts — distinct courses per group per Mon-Fri calendar day: "
         f"avg={_avg_distinct_courses_mf:.2f}, median={_median_distinct_mf:.2f}, "
-        f"max={metrics.max_distinct_subjects_any_group_day} "
+        f"max={(max(_mf_distinct_counts) if _mf_distinct_counts else 0)} "
         f"({_n_mf_days} group×days; {_pct_one_course:.0f}% with 1 course, {_pct_two_courses:.0f}% with 2; "
         "1 often means lec/tut/lab same course; lower is better)"
     )
-    _b1_en_groups = resolve_selector_map(cfg).get("@bachelor_1_en", set())
-    if _b1_en_groups:
-        _b1_mf = _collect_distinct_counts_for_groups(
-            metrics.per_group_per_day_distinct_subjects, _b1_en_groups
-        )
-        _b1_mon = _collect_distinct_counts_for_groups(
-            metrics.per_group_per_day_distinct_subjects,
-            _b1_en_groups,
-            weekdays=frozenset({0}),
-        )
-        _n_b1_mf = len(_b1_mf)
-        _avg_b1_mf = sum(_b1_mf) / _n_b1_mf if _b1_mf else 0.0
-        _med_b1_mf = statistics.median(_b1_mf) if _b1_mf else 0.0
-        _avg_b1_mon = sum(_b1_mon) / len(_b1_mon) if _b1_mon else 0.0
-        print(
-            "  @bachelor_1_en only (B25-CSE*, B25-DSAI*): Mon–Fri avg="
-            f"{_avg_b1_mf:.2f}, median={_med_b1_mf:.2f} ({_n_b1_mf} group×days); "
-            f"Mondays avg distinct courses={_avg_b1_mon:.2f} ({len(_b1_mon)} group×Mondays)"
-        )
     print(f"Saturday events (less is better): {metrics.saturday_event_count}")
 
     print(
-        "\nPer weekday (events | timeslot histogram | meeting hours × group count | "
+        "\nPer weekday\n(events | timeslot histogram | meeting hours × group count | "
         "avg distinct courses per group×day):"
     )
     _avg_distinct_wd = _avg_distinct_courses_by_weekday_label(metrics.per_group_per_day_distinct_subjects)
@@ -1007,14 +1091,25 @@ def _print_human_report(metrics: ScheduleMetrics, cfg: ScheduleConfig) -> None:
         | set(metrics.meeting_hours_weighted_by_group_count_per_weekday)
         | set(_avg_distinct_wd)
     )
+    weekday_rows: list[tuple[str, int, str, float, float]] = []
+    hist_count_w = max(
+        (len(str(count)) for hist in metrics.timeslot_histogram_by_weekday.values() for count in hist.values()),
+        default=1,
+    )
     for weekday, _ in _sort_weekday_items([(w, None) for w in _weekdays_union]):
         ev = metrics.events_per_weekday.get(weekday, 0)
         histogram = metrics.timeslot_histogram_by_weekday.get(weekday, {})
-        bins = ", ".join(f"{slot}={count}" for slot, count in histogram.items())
+        bins = ", ".join(f"{slot}={count:<{hist_count_w}}" for slot, count in histogram.items())
         hrs = metrics.meeting_hours_weighted_by_group_count_per_weekday.get(weekday, 0.0)
-        mid = bins if bins else "—"
         avg_dc = _avg_distinct_wd.get(weekday, 0.0)
-        print(f"  {weekday}: {ev} | {mid} | {hrs:.1f} | {avg_dc:.2f}")
+        weekday_rows.append((weekday, ev, bins if bins else "—", hrs, avg_dc))
+
+    ev_w = max((len(str(ev)) for _, ev, _, _, _ in weekday_rows), default=1)
+    hist_w = max((len(hist) for _, _, hist, _, _ in weekday_rows), default=1)
+    hrs_w = max((len(f"{hrs:.1f}") for _, _, _, hrs, _ in weekday_rows), default=1)
+    avg_w = max((len(f"{avg:.2f}") for _, _, _, _, avg in weekday_rows), default=1)
+    for weekday, ev, hist, hrs, avg_dc in weekday_rows:
+        print(f"  {weekday}: {ev:>{ev_w}} | {hist:<{hist_w}} | {hrs:>{hrs_w}.1f} | {avg_dc:>{avg_w}.2f}")
 
     print("\nEvents per course/component:")
     for course_name, components in metrics.events_per_course_components_grouped.items():
@@ -1022,9 +1117,7 @@ def _print_human_report(metrics: ScheduleMetrics, cfg: ScheduleConfig) -> None:
         print(f"  {course_name}: [{formatted}]")
 
     print("\nRoom utilization by room:")
-    for room_id in sorted(
-        set(metrics.room_capacity_utilization_by_room) | set(metrics.room_time_utilization_by_room)
-    ):
+    for room_id in sorted(set(metrics.room_capacity_utilization_by_room) | set(metrics.room_time_utilization_by_room)):
         time_u = metrics.room_time_utilization_by_room.get(room_id, 0.0)
         cap_u = metrics.room_capacity_utilization_by_room.get(room_id, 0.0)
         print(f"  {room_id}: time_util={time_u:.3f} capacity_util={cap_u:.3f}")
@@ -1033,41 +1126,59 @@ def _print_human_report(metrics: ScheduleMetrics, cfg: ScheduleConfig) -> None:
         "\nPer-group weekday load and distinct subjects "
         "(e=events, s=distinct courses; per weekday, mean over calendar days in term):"
     )
-    _load_ids = list(metrics.per_group_weekday_load.keys())
-    _subj_ids = [g for g in metrics.per_group_per_day_distinct_subjects if g not in metrics.per_group_weekday_load]
-    for group_id in _load_ids + _subj_ids:
-        load = metrics.per_group_weekday_load.get(group_id, {})
-        by_day = metrics.per_group_per_day_distinct_subjects.get(group_id, {})
-        _weekdays_here = set(load) | {
-            datetime.date.fromisoformat(day_iso).strftime("%a") for day_iso in by_day
-        }
-        ordered_days = [d for d, _ in _sort_weekday_items([(d, 0) for d in _weekdays_here])]
+
+    def _weekday_parts_for_groups(group_ids: list[str]) -> list[str]:
+        agg_load: dict[str, int] = defaultdict(int)
+        agg_subj_day_values: dict[str, list[int]] = defaultdict(list)
+        for group_id in group_ids:
+            load = per_group_weekday_load.get(group_id, {})
+            by_day = metrics.per_group_per_day_distinct_subjects.get(group_id, {})
+            for d, n in load.items():
+                agg_load[d] += n
+            for day_iso, n in by_day.items():
+                wd = datetime.date.fromisoformat(day_iso).strftime("%a")
+                agg_subj_day_values[wd].append(n)
+
+        weekdays_here = set(agg_load) | set(agg_subj_day_values)
+        ordered_days = [d for d, _ in _sort_weekday_items([(d, 0) for d in weekdays_here])]
         parts: list[str] = []
+        n_groups = max(1, len(group_ids))
         for d in ordered_days:
-            day_isos = [iso for iso in by_day if datetime.date.fromisoformat(iso).strftime("%a") == d]
-            n_cal = len(day_isos)
-            ev_total = load.get(d, 0)
-            if n_cal:
-                ev_m = ev_total / n_cal
-                s_m = sum(by_day[iso] for iso in day_isos) / n_cal
-            else:
-                ev_m = float(ev_total)
-                s_m = 0.0
+            ev_m = agg_load.get(d, 0) / n_groups
+            subj_vals = agg_subj_day_values.get(d, [])
+            s_m = (sum(subj_vals) / len(subj_vals)) if subj_vals else 0.0
             parts.append(f"{d}={round(ev_m)}e {round(s_m)}s")
-        print(f"  {group_id}: {', '.join(parts)}")
+        return parts
+
+    all_group_ids = sorted(set(per_group_weekday_load) | set(metrics.per_group_per_day_distinct_subjects))
+    printed_groups: set[str] = set()
+    for level in cfg.programs.values():
+        for program in level:
+            selector = f"@{program.id}"
+            program_groups = sorted(g for g in selector_map.get(selector, set()) if g in set(all_group_ids))
+            if not program_groups:
+                continue
+            prog_parts = _weekday_parts_for_groups(program_groups)
+            print(f"  {program.id}: {', '.join(prog_parts)}")
+            for group_id in program_groups:
+                grp_parts = _weekday_parts_for_groups([group_id])
+                print(f"\t{group_id}: {', '.join(grp_parts)}")
+                printed_groups.add(group_id)
+
+    for group_id in all_group_ids:
+        if group_id in printed_groups:
+            continue
+        grp_parts = _weekday_parts_for_groups([group_id])
+        print(f"\t{group_id}: {', '.join(grp_parts)}")
 
     # Only instructors with enough weekly meetings to be "loaded"; sorted by total (desc).
-    _min_instructor_week_load = 4
     _loaded: list[tuple[str, dict[str, int], int]] = []
     for inst, load in metrics.instructor_weekday_load.items():
         total = sum(load.values())
-        if total >= _min_instructor_week_load:
+        if total >= MIN_INSTRUCTOR_WEEK_LOAD:
             _loaded.append((inst, load, total))
     _loaded.sort(key=lambda t: (-t[2], t[0]))
-    print(
-        "\nInstructor weekday load "
-        f"(total weekly meetings; only total>={_min_instructor_week_load}; more is busier):"
-    )
+    print(f"\nInstructor weekday load (total weekly meetings; only total>={MIN_INSTRUCTOR_WEEK_LOAD}; more is busier):")
     if _loaded:
         for inst, load, total in _loaded:
             ordered = _sort_weekday_items(list(load.items()))
@@ -1121,16 +1232,25 @@ def _print_human_report(metrics: ScheduleMetrics, cfg: ScheduleConfig) -> None:
             print(f"  - {item}")
 
 
+def _print_json_report(metrics: ScheduleMetrics) -> None:
+    print(json.dumps(asdict(metrics), indent=2, sort_keys=True, default=str))
+
+
 def cli_main() -> None:
     parser = argparse.ArgumentParser(description="Compute schedule metrics from config and solution YAML files.")
     parser.add_argument("--config", required=True, type=Path, help="Path to schedule config YAML.")
     parser.add_argument("--solution", required=True, type=Path, help="Path to solver output YAML.")
+    parser.add_argument("--json", action="store_true", help="Print metrics as JSON.")
+    parser.add_argument("--short", action="store_true", help="Print only summary section in human report.")
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
     result = _load_solution(args.solution)
     metrics = calculate_schedule_metrics(result, cfg)
-    _print_human_report(metrics, cfg)
+    if args.json:
+        _print_json_report(metrics)
+    else:
+        _print_human_report(metrics, cfg, result.status, short=args.short)
 
 
 if __name__ == "__main__":
