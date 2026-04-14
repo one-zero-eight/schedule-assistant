@@ -27,6 +27,19 @@ DAY_TO_WEEKDAY = {
 }
 
 
+class _YamlDumper(yaml.SafeDumper):
+    pass
+
+
+def _yaml_str_presenter(dumper: yaml.SafeDumper, data: str):
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_YamlDumper.add_representer(str, _yaml_str_presenter)
+
+
 
 def _safe_term_segment(cfg: ScheduleConfig) -> str:
     safe = "".join(ch if ch.isalnum() or ch in " -_" else "_" for ch in cfg.term.name.strip() or "term")
@@ -48,7 +61,13 @@ def save_output(artifacts_dir: Path | None, result: SolveResult) -> None:
     if artifacts_dir is None:
         return
     (artifacts_dir / "output.yaml").write_text(
-        yaml.safe_dump(result.model_dump(mode="json"), sort_keys=False, allow_unicode=True),
+        yaml.dump(
+            result.model_dump(mode="json"),
+            Dumper=_YamlDumper,
+            sort_keys=False,
+            allow_unicode=True,
+            width=10_000,
+        ),
         encoding="utf-8",
     )
 
@@ -99,11 +118,25 @@ class Schedule(SettingBaseModel):
 
 
 class SolveStats(SettingBaseModel):
+    class PhaseStats(SettingBaseModel):
+        phase: str
+        decision: str
+        solver_status: str | None = None
+        objective_value: float | None = None
+        best_objective_bound: float | None = None
+        max_time_in_seconds: float | None = None
+        solver_parameters: str | None = None
+        variable_count: int | None = None
+        constraint_count: int | None = None
+        response_stats: str | None = None
+        solution_info: str | None = None
+
     meetings: int
     slots: int
     error: str | None = None
     slots_per_day: int | None = None
     teaching_days: int | None = None
+    phase_stats: list[PhaseStats] = []
 
 
 class SolveResult(SettingBaseModel):
@@ -119,10 +152,10 @@ class SolveResult(SettingBaseModel):
     + EMPTY when the solver did not run: nothing to schedule, or a pre-solver
       validation failure (see stats.error). Not a CP-SAT status.
     """
-    schedule: Schedule
     stats: SolveStats
     artifacts_dir: Path | None = None
     "Directory containing solver artifacts (e.g. output.yaml, solver_log_phase_*.txt); None when no artifact directory is used."
+    schedule: Schedule
 
 
 def teaching_dates(cfg: ScheduleConfig) -> list[datetime.date]:
@@ -143,6 +176,7 @@ def solve_schedule(
     *,
     show_progress: bool,
     artifacts_dir: Path | None = None,
+    num_search_workers: int | None = None,
 ) -> SolveResult:
     # Precompute static scheduling inputs from config.
     selector_map = resolve_selector_map(cfg)
@@ -246,7 +280,7 @@ def solve_schedule(
     absolute_start_vars: list[cp_model.IntVar] = []
     absolute_end_vars: list[cp_model.IntVar] = []
     room_vars: list[cp_model.IntVar] = []
-    room_pick_vars: list[list[cp_model.BoolVarT]] = []
+    room_pick_vars: list[dict[int, cp_model.BoolVarT]] = []
     inst_choice_vars: list[cp_model.IntVar] = []
     weekday_vars: list[cp_model.IntVar] = []
     group_intervals: dict[str, list[cp_model.IntervalVar]] = defaultdict(list)
@@ -255,6 +289,45 @@ def solve_schedule(
     inst_to_intervals: dict[str, list[cp_model.IntervalVar]] = defaultdict(list)
 
     max_abs = num_dates * slots_per_day
+    FALLBACK_ATTENDANCE_RATIO = 0.9
+    required_capacity_by_meeting: dict[int, int] = {}
+    feasible_room_indices_by_meeting: dict[int, list[int]] = {}
+    for i, meeting in enumerate(meetings):
+        students = meeting.expected_students
+        if students <= 0:
+            feasible_rooms = list(range(len(room_ids)))
+            if not feasible_rooms:
+                result = SolveResult(
+                    status="EMPTY",
+                    schedule=Schedule(),
+                    stats=SolveStats(meetings=len(meetings), slots=num_dates * slots_per_day, error="no feasible room"),
+                    artifacts_dir=artifacts_dir,
+                )
+                save_output(artifacts_dir, result)
+                return result
+            feasible_room_indices_by_meeting[i] = feasible_rooms
+            continue
+        feasible_for_full = any(capacity >= students for capacity in room_capacities)
+        required_capacity = students
+        if students > 100 or not feasible_for_full:
+            required_capacity = math.ceil(students * FALLBACK_ATTENDANCE_RATIO)
+        required_capacity = max(1, required_capacity)
+        required_capacity_by_meeting[i] = required_capacity
+        feasible_rooms = [room_idx for room_idx, cap in enumerate(room_capacities) if cap >= required_capacity]
+        if not feasible_rooms:
+            result = SolveResult(
+                status="EMPTY",
+                schedule=Schedule(),
+                stats=SolveStats(
+                    meetings=len(meetings),
+                    slots=num_dates * slots_per_day,
+                    error=f"no feasible room for meeting {i}",
+                ),
+                artifacts_dir=artifacts_dir,
+            )
+            save_output(artifacts_dir, result)
+            return result
+        feasible_room_indices_by_meeting[i] = feasible_rooms
     weekday_markers = [d.weekday() for d in dates]
 
     for i, m in enumerate(meetings):
@@ -290,7 +363,13 @@ def solve_schedule(
                 if student in shared_students:
                     student_intervals[student].append(core)
 
-        room_v = model.new_int_var(0, len(room_ids) - 1, f"room_{i}")
+        feasible_room_indices = feasible_room_indices_by_meeting[i]
+        if len(feasible_room_indices) == 1:
+            room_v = model.new_constant(feasible_room_indices[0])
+        else:
+            room_v = model.new_int_var_from_domain(
+                cp_model.Domain.FromValues(feasible_room_indices), f"room_{i}"
+            )
         room_vars.append(room_v)
 
         n_opts = len(m.instructor_options)
@@ -302,7 +381,8 @@ def solve_schedule(
 
     # Hard constraint: a student group cannot attend overlapping meetings.
     for ivals in tqdm(group_intervals.values(), desc="Group constraints", disable=not show_progress):
-        model.add_no_overlap(ivals)
+        if len(ivals) > 1:
+            model.add_no_overlap(ivals)
     # Hard constraint: a single student present in multiple groups (e.g. academic + English)
     # cannot have overlapping meetings across those groups.
     for ivals in tqdm(student_intervals.values(), desc="Student constraints", disable=not show_progress):
@@ -313,19 +393,21 @@ def solve_schedule(
         # Room assignment: exactly one room per meeting, represented as optional intervals.
         dur = m.duration
         abs_s, abs_e = absolute_start_vars[i], absolute_end_vars[i]
-        room_bools: list[cp_model.BoolVarT] = []
-        for r in range(len(room_ids)):
+        feasible_room_indices = feasible_room_indices_by_meeting[i]
+        room_bools: dict[int, cp_model.BoolVarT] = {}
+        for r in feasible_room_indices:
             b = model.new_bool_var(f"room_pick_{i}_{r}")
-            room_bools.append(b)
+            room_bools[r] = b
             model.add(room_vars[i] == r).OnlyEnforceIf(b)
             model.add(room_vars[i] != r).OnlyEnforceIf(b.Not())
             room_intervals[r].append(model.new_optional_interval_var(abs_s, dur, abs_e, b, f"room_iv_{i}_{r}"))
-        model.add_exactly_one(room_bools)
+        if len(feasible_room_indices) > 1:
+            model.add_exactly_one(room_bools.values())
         room_pick_vars.append(room_bools)
 
     # Hard constraint: a room cannot host more than one meeting at the same time.
     for r in tqdm(range(len(room_ids)), desc="Room constraints", disable=not show_progress):
-        if room_intervals[r]:
+        if len(room_intervals[r]) > 1:
             model.add_no_overlap(room_intervals[r])
 
     # Hard constraint: an instructor (or co-teaching set) cannot overlap in time.
@@ -348,7 +430,7 @@ def solve_schedule(
                 )
 
     for inst, ivals in inst_to_intervals.items():
-        if ivals:
+        if len(ivals) > 1:
             model.add_no_overlap(ivals)
 
     # Tiered soft-objective design:
@@ -364,7 +446,6 @@ def solve_schedule(
         return max(1, len(groups))
 
     # Objective weights (within room-family buckets).
-    FALLBACK_ATTENDANCE_RATIO = 0.9
     """When no room fits full enrollment, require capacity for ceil(90%) attendance."""
     ROOM_OVERSIZE_BUCKET_PENALTIES = (
         (30, 0),     # <=30% oversize is effectively free
@@ -372,9 +453,6 @@ def solve_schedule(
         (100, 300),  # >70% oversize
     )
     room_oversize_coeffs: dict[tuple[int, int], int] = {}
-    room_under_capacity_coeffs: dict[tuple[int, int], int] = {}
-    required_capacity_by_meeting: dict[int, int] = {}
-    UNDER_CAPACITY_EVENT_WEIGHT = 250
 
     # Room sizing constraints/objective terms:
     # - room under-capacity is hard-forbidden
@@ -386,14 +464,9 @@ def solve_schedule(
         if students <= 0:
             continue
 
-        feasible_for_full = any(capacity >= students for capacity in room_capacities)
-        required_capacity = students
-        if students > 100 or not feasible_for_full:
-            required_capacity = math.ceil(students * FALLBACK_ATTENDANCE_RATIO)
-        required_capacity_by_meeting[i] = max(1, required_capacity)
-
-        for room_idx, capacity in enumerate(room_capacities):
-            if capacity < required_capacity_by_meeting[i]:
+        for room_idx in feasible_room_indices_by_meeting[i]:
+            capacity = room_capacities[room_idx]
+            if capacity < required_capacity_by_meeting.get(i, students):
                 continue
 
             oversize_penalty = 0
@@ -406,35 +479,22 @@ def solve_schedule(
 
             impact = _meeting_impact(meeting.groups)
             weighted_oversize_penalty = oversize_penalty * impact
-            under_capacity_penalty = 0
-            if capacity < students:
-                # Keep fallback feasibility, but discourage under-capacity assignments.
-                under_capacity_penalty = UNDER_CAPACITY_EVENT_WEIGHT * impact
 
             room_oversize_coeffs[(i, room_idx)] = weighted_oversize_penalty
-            room_under_capacity_coeffs[(i, room_idx)] = under_capacity_penalty
 
     for i, meeting in enumerate(meetings):
         students = meeting.expected_students
         if students <= 0:
             continue
-        for room_idx, capacity in enumerate(room_capacities):
+        for room_idx in feasible_room_indices_by_meeting[i]:
             selected_room = room_pick_vars[i][room_idx]
-
-            if capacity < required_capacity_by_meeting.get(i, students):
-                model.add(room_vars[i] != room_idx)
-                continue
 
             oversize_coeff = room_oversize_coeffs.get((i, room_idx), 0)
             if oversize_coeff > 0:
                 tier2_terms.append(selected_room * oversize_coeff)
 
-            under_capacity_coeff = room_under_capacity_coeffs.get((i, room_idx), 0)
-            if under_capacity_coeff > 0:
-                tier2_terms.append(selected_room * under_capacity_coeff)
-
     # Soft relation between related components of the same audience/week.
-    ORDER_VIOLATION_WEIGHT = 700
+    ORDER_VIOLATION_WEIGHT = 500
     CROSS_DAY_VIOLATION_WEIGHT = 200
     CROSS_DAY_LAB_VIOLATION_WEIGHT = 40
     BACK_TO_BACK_MISS_WEIGHT = 600
@@ -535,7 +595,7 @@ def solve_schedule(
                             model.add(back_to_back_missed <= time_not_back_to_back + room_changed)
                             tier1_terms.append(back_to_back_missed * BACK_TO_BACK_MISS_WEIGHT * relation_impact)
 
-    # Tier 3 mild preferences: Saturday classes and later starts.
+    # Calendar/distribution preferences (merged into tier 2 quality objective).
     SATURDAY_EVENT_WEIGHT = 90
     saturday_markers = [1 if d.weekday() == 5 else 0 for d in dates]
     if SATURDAY_EVENT_WEIGHT > 0 and any(saturday_markers):
@@ -574,7 +634,7 @@ def solve_schedule(
         for g in m.groups:
             meetings_by_group[g].append(i)
 
-    # Tier 3 optional: student distribution quality.
+    # Optional: student distribution quality.
     STUDENT_SPREAD_WEIGHT = 10
     if STUDENT_SPREAD_WEIGHT > 0:
         for group_id, group_meeting_indices in meetings_by_group.items():
@@ -591,7 +651,7 @@ def solve_schedule(
             model.add(concentration == (num_dates - 1) - span)
             tier3_terms.append(concentration * STUDENT_SPREAD_WEIGHT)
 
-    # Tier 3 optional: weekday balancing for student groups.
+    # Optional: weekday balancing for student groups.
     # Focus on bachelor_1_en first (where overload was observed), fallback to all groups if selector missing.
     # This fights weekday clumping and discourages moving excessive load to Saturday.
     GROUP_WEEKDAY_BALANCE_WEIGHT = 24
@@ -650,21 +710,26 @@ def solve_schedule(
                 tier3_terms.append(wd_spread * GROUP_WEEKDAY_BALANCE_WEIGHT)
 
     tier1_expr = cp_model.LinearExpr.Sum(tier1_terms) if tier1_terms else 0
-    tier2_expr = cp_model.LinearExpr.Sum(tier2_terms) if tier2_terms else 0
-    tier3_expr = cp_model.LinearExpr.Sum(tier3_terms) if tier3_terms else 0
+    merged_tier2_terms = tier2_terms + tier3_terms
+    tier2_expr = cp_model.LinearExpr.Sum(merged_tier2_terms) if merged_tier2_terms else 0
 
-    objective_phases: list[tuple[str, cp_model.LinearExprT]] = []
-    if tier1_terms:
-        objective_phases.append(("tier1_pedagogical", tier1_expr))
-    if tier2_terms:
-        objective_phases.append(("tier2_room", tier2_expr))
-    if tier3_terms:
-        objective_phases.append(("tier3_calendar", tier3_expr))
+    phase_definitions: list[tuple[str, cp_model.LinearExprT, bool]] = [
+        ("tier1_pedagogical", tier1_expr, bool(tier1_terms)),
+        ("tier2_quality", tier2_expr, bool(merged_tier2_terms)),
+    ]
+    objective_phases: list[tuple[str, cp_model.LinearExprT]] = [
+        (phase_name, phase_expr)
+        for phase_name, phase_expr, enabled in phase_definitions
+        if enabled
+    ]
 
     solver = cp_model.CpSolver()
-    solver.parameters.num_search_workers = max(1, os.cpu_count() or 1)
+    available_cores = max(1, os.cpu_count() or 1)
+    default_workers = min(16, available_cores)
+    workers = default_workers if num_search_workers is None else max(1, int(num_search_workers))
+    solver.parameters.num_search_workers = workers
     solver.parameters.log_search_progress = True
-    solver.parameters.log_to_stdout = True
+    solver.parameters.log_to_stdout = show_progress
 
     raw_hint_int_vars: list[cp_model.IntVar] = []
     raw_hint_int_vars.extend(day_vars)
@@ -674,7 +739,7 @@ def solve_schedule(
 
     raw_hint_bool_vars: list[cp_model.BoolVarT] = []
     for room_bools in room_pick_vars:
-        raw_hint_bool_vars.extend(room_bools)
+        raw_hint_bool_vars.extend(room_bools.values())
 
     hint_int_vars: list[cp_model.IntVar] = []
     seen_hint_int_indices: set[int] = set()
@@ -694,115 +759,185 @@ def solve_schedule(
         seen_hint_bool_indices.add(idx)
         hint_bool_vars.append(v)
 
-    def _run_solver_once(active_log_paths: list[Path] | None = None):
-        if active_log_paths:
-            log_files = [open(path, "a", encoding="utf-8") for path in active_log_paths]
+    def _run_solver_once(active_log_path: Path | None = None):
+        if active_log_path is not None:
+            log_file = open(active_log_path, "a", encoding="utf-8")
 
             def _log_callback(msg: str) -> None:
-                for log_f in log_files:
-                    log_f.write(msg)
-                    log_f.write("\n")
+                log_file.write(msg)
+                log_file.write("\n")
 
             solver.log_callback = _log_callback
             try:
                 return solver.Solve(model)
             finally:
-                for log_f in log_files:
-                    log_f.close()
+                log_file.close()
                 solver.log_callback = None
         return solver.Solve(model)
 
     log_dir: Path | None = artifacts_dir
 
     deadline = time.monotonic() + float(time_limit)
+    phase_stats_by_name: dict[str, SolveStats.PhaseStats] = {}
+
+    def _compact_multiline(text: str) -> str:
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+        return "\n".join(lines)
+
+    def _set_phase_stats(
+        phase_name: str,
+        *,
+        decision: str,
+        phase_max_time: float | None = None,
+        run_status_name: str | None = None,
+        has_solution: bool = False,
+        include_best_bound: bool = False,
+    ) -> None:
+        if decision == "ran":
+            stats_text = _compact_multiline(solver.ResponseStats())
+            solution_info = _compact_multiline(solver.SolutionInfo())
+            solver_parameters = _compact_multiline(str(solver.parameters))
+            objective_value: float | None = None
+            if has_solution:
+                objective_value = float(solver.ObjectiveValue())
+            best_objective_bound: float | None = None
+            if include_best_bound:
+                best_objective_bound = float(solver.BestObjectiveBound())
+            phase_stats_by_name[phase_name] = SolveStats.PhaseStats(
+                phase=phase_name,
+                decision=decision,
+                solver_status=run_status_name,
+                objective_value=objective_value,
+                best_objective_bound=best_objective_bound,
+                max_time_in_seconds=float(phase_max_time) if phase_max_time is not None else None,
+                solver_parameters=solver_parameters,
+                variable_count=len(model.proto.variables),
+                constraint_count=len(model.proto.constraints),
+                response_stats=stats_text,
+                solution_info=solution_info,
+            )
+            return
+        phase_stats_by_name[phase_name] = SolveStats.PhaseStats(
+            phase=phase_name,
+            decision=decision,
+            max_time_in_seconds=float(phase_max_time) if phase_max_time is not None else None,
+        )
+
     status = cp_model.UNKNOWN
     best_feasible_status = None
     best_day_values: list[int] | None = None
     best_local_start_values: list[int] | None = None
     best_room_values: list[int] | None = None
     best_inst_choice_values: list[int] | None = None
-    if not objective_phases:
-        remaining = max(0.1, deadline - time.monotonic())
-        solver.parameters.max_time_in_seconds = remaining
+    for phase_name, _, enabled in phase_definitions:
+        _set_phase_stats(phase_name, decision=("pending" if enabled else "skipped_no_terms"))
+
+    assert objective_phases, "Expected at least one enabled objective phase."
+
+    base_phase_shares = [0.60, 0.40]
+    total_phases = len(objective_phases)
+    if total_phases <= len(base_phase_shares):
+        phase_shares = base_phase_shares[:total_phases]
+    else:
+        phase_shares = base_phase_shares + [0.0] * (total_phases - len(base_phase_shares))
+    blocked_remaining_phases = False
+    for phase_idx, (phase_name, phase_expr) in enumerate(objective_phases):
+        if blocked_remaining_phases:
+            _set_phase_stats(phase_name, decision="skipped_after_unsolved_phase")
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _set_phase_stats(phase_name, decision="skipped_no_time")
+            blocked_remaining_phases = True
+            break
+        remaining_share_sum = sum(phase_shares[phase_idx:])
+        phase_ratio = (phase_shares[phase_idx] / remaining_share_sum) if remaining_share_sum > 0 else 1.0
+        phase_budget = max(0.1, remaining * phase_ratio)
+        solver.parameters.max_time_in_seconds = phase_budget
+        phase_max_time = float(solver.parameters.max_time_in_seconds)
+        model.minimize(phase_expr)
         if log_dir is not None:
-            phase_log_path = log_dir / "solver_log_phase_1.txt"
+            phase_log_path = log_dir / f"solver_log_phase_{phase_idx + 1}.txt"
             phase_log_path.write_text("", encoding="utf-8")
-            status = _run_solver_once([phase_log_path])
+            status = _run_solver_once(phase_log_path)
         else:
             status = _run_solver_once()
-    else:
-        # Run a short feasibility pass first to seed objective phases with a concrete schedule.
-        warm_start_share = 0.25
-        warm_remaining = deadline - time.monotonic()
-        if warm_remaining > 0:
-            warm_budget = max(0.1, min(warm_remaining, float(time_limit) * warm_start_share))
-            solver.parameters.max_time_in_seconds = warm_budget
-            if log_dir is not None:
-                warm_log_path = log_dir / "solver_log_phase_0_feasibility.txt"
-                warm_log_path.write_text("", encoding="utf-8")
-                status = _run_solver_once([warm_log_path])
-            else:
-                status = _run_solver_once()
-            if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                best_feasible_status = status
-                best_day_values = [solver.Value(v) for v in day_vars]
-                best_local_start_values = [solver.Value(v) for v in local_start_vars]
-                best_room_values = [solver.Value(v) for v in room_vars]
-                best_inst_choice_values = [solver.Value(v) for v in inst_choice_vars]
-                model.clear_hints()
-                for v in hint_int_vars:
-                    model.add_hint(v, solver.Value(v))
-                for v in hint_bool_vars:
-                    model.add_hint(v, bool(solver.Value(v)))
+        _set_phase_stats(
+            phase_name,
+            decision="ran",
+            phase_max_time=phase_max_time,
+            run_status_name=solver.StatusName(status),
+            has_solution=status in (cp_model.OPTIMAL, cp_model.FEASIBLE),
+            include_best_bound=status in (cp_model.OPTIMAL, cp_model.FEASIBLE, cp_model.UNKNOWN),
+        )
 
-        total_phases = len(objective_phases)
-        if total_phases == 1:
-            phase_shares = [1.0]
-        elif total_phases == 2:
-            phase_shares = [0.75, 0.25]
-        else:
-            tail_share = 0.15
-            middle_share = 0.25
-            first_share = 1.0 - middle_share - tail_share
-            phase_shares = [first_share, middle_share]
-            phase_shares.extend([tail_share / (total_phases - 2)] * (total_phases - 2))
-        for phase_idx, (phase_name, phase_expr) in enumerate(objective_phases):
+        if status == cp_model.UNKNOWN:
+            remaining_after_phase = deadline - time.monotonic()
+            if remaining_after_phase > 0:
+                solver.parameters.max_time_in_seconds = max(0.1, remaining_after_phase)
+                phase_max_time = float(solver.parameters.max_time_in_seconds)
+                if log_dir is not None:
+                    extended_phase_log_path = log_dir / f"solver_log_phase_{phase_idx + 1}_extended.txt"
+                    extended_phase_log_path.write_text("", encoding="utf-8")
+                    status = _run_solver_once(extended_phase_log_path)
+                else:
+                    status = _run_solver_once()
+                _set_phase_stats(
+                    f"{phase_name}_extended",
+                    decision="ran",
+                    phase_max_time=phase_max_time,
+                    run_status_name=solver.StatusName(status),
+                    has_solution=status in (cp_model.OPTIMAL, cp_model.FEASIBLE),
+                    include_best_bound=status in (cp_model.OPTIMAL, cp_model.FEASIBLE, cp_model.UNKNOWN),
+                )
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            blocked_remaining_phases = True
+            break
+
+        phase_value = int(round(solver.ObjectiveValue()))
+        model.add(phase_expr <= phase_value)
+        best_feasible_status = status
+        best_day_values = [solver.Value(v) for v in day_vars]
+        best_local_start_values = [solver.Value(v) for v in local_start_vars]
+        best_room_values = [solver.Value(v) for v in room_vars]
+        best_inst_choice_values = [solver.Value(v) for v in inst_choice_vars]
+
+        # Hint the found solution for next objective phase.
+        if phase_idx < len(objective_phases) - 1:
+            model.clear_hints()
+            for v in hint_int_vars:
+                model.add_hint(v, solver.Value(v))
+            for v in hint_bool_vars:
+                model.add_hint(v, bool(solver.Value(v)))
+
+    # Finalize untouched enabled phases that remained "pending".
+    for phase_name, _, enabled in phase_definitions:
+        if not enabled:
+            continue
+        existing = phase_stats_by_name.get(phase_name)
+        if existing is None or existing.decision == "pending":
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                break
-            phase_budget = float(time_limit) * phase_shares[phase_idx]
-            solver.parameters.max_time_in_seconds = max(0.1, min(phase_budget, remaining))
-            model.minimize(phase_expr)
-            if log_dir is not None:
-                phase_log_path = log_dir / f"solver_log_phase_{phase_idx + 1}.txt"
-                phase_log_path.write_text("", encoding="utf-8")
-                status = _run_solver_once([phase_log_path])
-            else:
-                status = _run_solver_once()
-            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                break
-
-            phase_value = int(round(solver.ObjectiveValue()))
-            model.add(phase_expr == phase_value)
-            best_feasible_status = status
-            best_day_values = [solver.Value(v) for v in day_vars]
-            best_local_start_values = [solver.Value(v) for v in local_start_vars]
-            best_room_values = [solver.Value(v) for v in room_vars]
-            best_inst_choice_values = [solver.Value(v) for v in inst_choice_vars]
-
-            # Hint the found solution for next objective phase.
-            if phase_idx < len(objective_phases) - 1:
-                model.clear_hints()
-                for v in hint_int_vars:
-                    model.add_hint(v, solver.Value(v))
-                for v in hint_bool_vars:
-                    model.add_hint(v, bool(solver.Value(v)))
+                _set_phase_stats(phase_name, decision="skipped_no_time")
+            elif blocked_remaining_phases:
+                _set_phase_stats(phase_name, decision="skipped_after_unsolved_phase")
 
     stats = SolveStats(
         meetings=len(meetings),
         slots=num_dates * slots_per_day,
         slots_per_day=slots_per_day,
         teaching_days=num_dates,
+        phase_stats=[
+            phase_stats_by_name[name]
+            for name in ("tier1_pedagogical", "tier2_quality")
+            if name in phase_stats_by_name
+        ]
+        + [
+            phase_stats_by_name[name]
+            for name in phase_stats_by_name
+            if name.endswith("_extended")
+        ],
     )
     schedule_empty = Schedule()
 
@@ -922,9 +1057,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("config", type=Path)
     parser.add_argument("--time-limit", type=int, default=60)
+    parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--no-progress", action="store_true")
 
     args = parser.parse_args()
+    if args.num_workers is not None and args.num_workers < 1:
+        parser.error("--num-workers must be >= 1")
 
     cfg = ScheduleConfig.from_yaml(args.config)
 
@@ -934,6 +1072,7 @@ def main():
         args.time_limit,
         show_progress=not args.no_progress,
         artifacts_dir=results_dir,
+        num_search_workers=args.num_workers,
     )
 
     print(
