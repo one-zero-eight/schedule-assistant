@@ -4,6 +4,9 @@ config-candidate*.yaml
 .pytest_tmp/
 *.xlsx
 predefined.json
+cpsat-primer-README.md
+cpsat-primer-examples/
+MIGRATE.md
 
 # Created by https://www.toptal.com/developers/gitignore/api/python,vs,pycharm+all,macos,windows,linux
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,vs,pycharm+all,macos,windows,linux

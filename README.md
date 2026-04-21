@@ -26,7 +26,7 @@ uv run python tests/cases/generate_cases.py
 ## Run the solver (`main.py`)
 
 ```bash
-uv run python main.py tests/cases/feasible_one_week_full_with_english_block1/all_bachelors_masters_phd_with_english.yaml --time-limit 10
+uv run python main.py tests/cases/feasible_by_program_year_block1/core_year_1.yaml --time-limit 60
 ```
 
 **Output:** prints `status` and `stats` to stdout. Writes the full result to:
@@ -56,6 +56,17 @@ uv run python metrics.py \
 ```
 
 Use the `output.yaml` from the same `main.py` run (under `results/...`).
+
+## Get cpsat-primer examples and README.md
+
+```bash
+git clone https://github.com/d-krupke/cpsat-primer --depth 1
+cd cpsat-primer
+mv README.md ../cpsat-primer-README.md
+mv examples ../cpsat-primer-examples
+cd ..
+rm -rf cpsat-primer
+```
 
 ## Tests
 
