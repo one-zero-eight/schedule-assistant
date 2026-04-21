@@ -60,6 +60,11 @@ def _results_dir_for_run(cfg: ScheduleConfig) -> Path:
 def save_output(artifacts_dir: Path | None, result: SolveResult) -> None:
     if artifacts_dir is None:
         return
+    saved_at = datetime.datetime.now(datetime.timezone.utc)
+    if result.stats.started_at is None:
+        result.stats.started_at = saved_at
+    result.stats.saved_at = saved_at
+    result.stats.elapsed_seconds = max(0.0, (saved_at - result.stats.started_at).total_seconds())
     (artifacts_dir / "output.yaml").write_text(
         yaml.dump(
             result.model_dump(mode="json"),
@@ -96,10 +101,10 @@ class CourseSchedule(SettingBaseModel):
             """Parallel lists for one audience (group set) across sessions."""
 
             audience: list[str]
-            instructors: list[list[str]]
-            dates: list[datetime.date]
+            days: list[str]
             start_times: list[datetime.time]
             rooms: list[str]
+            instructors: list[list[str]]
 
         tag: str
         student_groups: list[str]
@@ -134,6 +139,9 @@ class SolveStats(SettingBaseModel):
     meetings: int
     slots: int
     error: str | None = None
+    started_at: datetime.datetime | None = None
+    saved_at: datetime.datetime | None = None
+    elapsed_seconds: float | None = None
     slots_per_day: int | None = None
     teaching_days: int | None = None
     phase_stats: list[PhaseStats] = []
@@ -158,16 +166,23 @@ class SolveResult(SettingBaseModel):
     schedule: Schedule
 
 
-def teaching_dates(cfg: ScheduleConfig) -> list[datetime.date]:
-    allowed_days = {DAY_TO_WEEKDAY[d] for d in cfg.term.days}
-    out: list[datetime.date] = []
-    cur = cfg.term.semester.start_date
-    end = cfg.term.semester.end_date
-    while cur <= end:
-        if cur.weekday() in allowed_days:
-            out.append(cur)
-        cur += datetime.timedelta(days=1)
-    return out
+def teaching_days(cfg: ScheduleConfig) -> list[str]:
+    """Build one teaching week ordered from `term.starting_day`."""
+    configured_days: list[str] = []
+    seen_days: set[str] = set()
+    for raw_day in cfg.term.days:
+        day = str(raw_day).strip()
+        if day not in DAY_TO_WEEKDAY or day in seen_days:
+            continue
+        seen_days.add(day)
+        configured_days.append(day)
+    if not configured_days:
+        return []
+    start_day = str(cfg.term.starting_day).strip()
+    if start_day not in configured_days:
+        return configured_days
+    start_idx = configured_days.index(start_day)
+    return configured_days[start_idx:] + configured_days[:start_idx]
 
 
 def solve_schedule(
@@ -178,19 +193,26 @@ def solve_schedule(
     artifacts_dir: Path | None = None,
     num_search_workers: int | None = None,
 ) -> SolveResult:
+    run_started_at = datetime.datetime.now(datetime.timezone.utc)
+
+    def _save_and_return(result: SolveResult) -> SolveResult:
+        if result.stats.started_at is None:
+            result.stats.started_at = run_started_at
+        save_output(artifacts_dir, result)
+        return result
+
     # Precompute static scheduling inputs from config.
     selector_map = resolve_selector_map(cfg)
-    dates = teaching_dates(cfg)
-    num_dates = len(dates)
-    if num_dates == 0:
+    days = teaching_days(cfg)
+    num_days = len(days)
+    if num_days == 0:
         result = SolveResult(
             status="EMPTY",
             schedule=Schedule(),
-            stats=SolveStats(meetings=0, slots=0, error="no teaching days in term range"),
+            stats=SolveStats(meetings=0, slots=0, error="no teaching days in term"),
             artifacts_dir=artifacts_dir,
         )
-        save_output(artifacts_dir, result)
-        return result
+        return _save_and_return(result)
 
     slots_per_day = len(cfg.term.time_slots)
     room_ids = [r.id for r in cfg.rooms]
@@ -201,24 +223,20 @@ def solve_schedule(
             stats=SolveStats(meetings=0, slots=0, error="no rooms in config"),
             artifacts_dir=artifacts_dir,
         )
-        save_output(artifacts_dir, result)
-        return result
+        return _save_and_return(result)
 
-    delta = cfg.term.semester.end_date - cfg.term.semester.start_date
-    num_weeks = max(1, delta.days // 7)
     room_capacities = [r.capacity for r in cfg.rooms]
     group_size_map: dict[str, int] = {}
     group_students_map: dict[str, set[str]] = defaultdict(set)
     student_groups_membership: dict[str, set[str]] = defaultdict(set)
-    for bucket in (cfg.student_groups.academic, cfg.student_groups.english, cfg.student_groups.elective):
-        for group in bucket:
-            group_size_map[group.id] = max(0, int(group.estimated_size or 0))
-            for student_email in group.students:
+    for group in cfg.students_groups:
+        group_size_map[group.code] = max(0, int(group.estimated_size or 0))
+        for student_email in group.students:
                 student = student_email.strip().lower()
                 if not student:
                     continue
-                group_students_map[group.id].add(student)
-                student_groups_membership[student].add(group.id)
+                group_students_map[group.code].add(student)
+                student_groups_membership[student].add(group.code)
     shared_students = {student for student, groups in student_groups_membership.items() if len(groups) > 1}
 
     # Expand course components into concrete meeting instances (one per week/audience).
@@ -231,7 +249,7 @@ def solve_schedule(
 
             audiences = [[g] for g in groups] if cls.per_group else [groups]
 
-            count = cls.per_week * num_weeks
+            count = cls.per_week
 
             instructor_options: list[list[str]] = []
             if cls.instructor_pool:
@@ -266,11 +284,10 @@ def solve_schedule(
         result = SolveResult(
             status="EMPTY",
             schedule=Schedule(),
-            stats=SolveStats(meetings=0, slots=num_dates * slots_per_day),
+            stats=SolveStats(meetings=0, slots=num_days * slots_per_day),
             artifacts_dir=artifacts_dir,
         )
-        save_output(artifacts_dir, result)
-        return result
+        return _save_and_return(result)
 
     # CP-SAT model: each meeting gets day/time/room/instructor decision variables.
     model = cp_model.CpModel()
@@ -288,7 +305,7 @@ def solve_schedule(
     room_intervals: dict[int, list[cp_model.IntervalVar]] = defaultdict(list)
     inst_to_intervals: dict[str, list[cp_model.IntervalVar]] = defaultdict(list)
 
-    max_abs = num_dates * slots_per_day
+    max_abs = num_days * slots_per_day
     FALLBACK_ATTENDANCE_RATIO = 0.9
     required_capacity_by_meeting: dict[int, int] = {}
     feasible_room_indices_by_meeting: dict[int, list[int]] = {}
@@ -300,11 +317,10 @@ def solve_schedule(
                 result = SolveResult(
                     status="EMPTY",
                     schedule=Schedule(),
-                    stats=SolveStats(meetings=len(meetings), slots=num_dates * slots_per_day, error="no feasible room"),
+                    stats=SolveStats(meetings=len(meetings), slots=num_days * slots_per_day, error="no feasible room"),
                     artifacts_dir=artifacts_dir,
                 )
-                save_output(artifacts_dir, result)
-                return result
+                return _save_and_return(result)
             feasible_room_indices_by_meeting[i] = feasible_rooms
             continue
         feasible_for_full = any(capacity >= students for capacity in room_capacities)
@@ -320,20 +336,19 @@ def solve_schedule(
                 schedule=Schedule(),
                 stats=SolveStats(
                     meetings=len(meetings),
-                    slots=num_dates * slots_per_day,
+                    slots=num_days * slots_per_day,
                     error=f"no feasible room for meeting {i}",
                 ),
                 artifacts_dir=artifacts_dir,
             )
-            save_output(artifacts_dir, result)
-            return result
+            return _save_and_return(result)
         feasible_room_indices_by_meeting[i] = feasible_rooms
-    weekday_markers = [d.weekday() for d in dates]
+    weekday_markers = [DAY_TO_WEEKDAY[d] for d in days]
 
     for i, m in enumerate(meetings):
         # Time placement vars + absolute-slot interval for overlap constraints.
         dur = m.duration
-        day_v = model.new_int_var(0, num_dates - 1, f"day_{i}")
+        day_v = model.new_int_var(0, num_days - 1, f"day_{i}")
         loc_lo = max(0, slots_per_day - dur)
         local_s = model.new_int_var(0, loc_lo, f"local_start_{i}")
         local_e = model.new_int_var(dur, slots_per_day, f"local_end_{i}")
@@ -597,7 +612,7 @@ def solve_schedule(
 
     # Calendar/distribution preferences (merged into tier 2 quality objective).
     SATURDAY_EVENT_WEIGHT = 90
-    saturday_markers = [1 if d.weekday() == 5 else 0 for d in dates]
+    saturday_markers = [1 if wd == 5 else 0 for wd in weekday_markers]
     if SATURDAY_EVENT_WEIGHT > 0 and any(saturday_markers):
         for i, m in enumerate(meetings):
             meeting_on_saturday = model.new_int_var(0, 1, f"on_saturday_{i}")
@@ -638,17 +653,17 @@ def solve_schedule(
     STUDENT_SPREAD_WEIGHT = 10
     if STUDENT_SPREAD_WEIGHT > 0:
         for group_id, group_meeting_indices in meetings_by_group.items():
-            if len(group_meeting_indices) < 2 or num_dates < 2:
+            if len(group_meeting_indices) < 2 or num_days < 2:
                 continue
             group_day_vars = [day_vars[idx] for idx in group_meeting_indices]
-            max_day = model.new_int_var(0, num_dates - 1, f"group_{group_id}_max_day")
-            min_day = model.new_int_var(0, num_dates - 1, f"group_{group_id}_min_day")
-            span = model.new_int_var(0, num_dates - 1, f"group_{group_id}_span")
-            concentration = model.new_int_var(0, num_dates - 1, f"group_{group_id}_concentration")
+            max_day = model.new_int_var(0, num_days - 1, f"group_{group_id}_max_day")
+            min_day = model.new_int_var(0, num_days - 1, f"group_{group_id}_min_day")
+            span = model.new_int_var(0, num_days - 1, f"group_{group_id}_span")
+            concentration = model.new_int_var(0, num_days - 1, f"group_{group_id}_concentration")
             model.add_max_equality(max_day, group_day_vars)
             model.add_min_equality(min_day, group_day_vars)
             model.add(span == max_day - min_day)
-            model.add(concentration == (num_dates - 1) - span)
+            model.add(concentration == (num_days - 1) - span)
             tier3_terms.append(concentration * STUDENT_SPREAD_WEIGHT)
 
     # Optional: weekday balancing for student groups.
@@ -658,9 +673,9 @@ def solve_schedule(
     GROUP_WEEKDAY_OVERLOAD_WEIGHT = 22
     GROUP_SATURDAY_LOAD_WEIGHT = 10
     active_weekdays = sorted({DAY_TO_WEEKDAY[d] for d in cfg.term.days})
-    weekday_occurrences = {wd: sum(1 for d in dates if d.weekday() == wd) for wd in active_weekdays}
+    weekday_occurrences = {wd: weekday_markers.count(wd) for wd in active_weekdays}
     meeting_on_weekday: dict[tuple[int, int], cp_model.BoolVarT] = {}
-    target_groups = resolve_selector_map(cfg).get("@bachelor_1_en", set())
+    target_groups = selector_map.get("@bs_y1_en", set())
     balanced_group_ids = (
         [g for g in meetings_by_group if g in target_groups]
         if target_groups
@@ -925,9 +940,9 @@ def solve_schedule(
 
     stats = SolveStats(
         meetings=len(meetings),
-        slots=num_dates * slots_per_day,
+        slots=num_days * slots_per_day,
         slots_per_day=slots_per_day,
-        teaching_days=num_dates,
+        teaching_days=num_days,
         phase_stats=[
             phase_stats_by_name[name]
             for name in ("tier1_pedagogical", "tier2_quality")
@@ -965,8 +980,7 @@ def solve_schedule(
                 stats=stats,
                 artifacts_dir=artifacts_dir,
             )
-            save_output(artifacts_dir, result)
-            return result
+            return _save_and_return(result)
 
     def _value_or_snapshot(
         idx: int,
@@ -993,7 +1007,7 @@ def solve_schedule(
                 continue
 
             instances_map: dict[tuple[str, ...], dict[str, list]] = defaultdict(
-                lambda: {"dates": [], "start_times": [], "rooms": [], "instructors": []}
+                lambda: {"days": [], "day_indices": [], "start_times": [], "rooms": [], "instructors": []}
             )
 
             for m_idx in meeting_indices:
@@ -1004,30 +1018,39 @@ def solve_schedule(
                 r_val = _value_or_snapshot(m_idx, room_vars, best_room_values)
                 inst_opt_idx = _value_or_snapshot(m_idx, inst_choice_vars, best_inst_choice_values)
 
-                d = dates[di]
+                day_name = days[di]
                 slot_time = cfg.term.time_slots[t_idx]
                 room_id = room_ids[r_val]
                 chosen_insts = m.instructor_options[inst_opt_idx] if m.instructor_options else []
 
                 g_key = tuple(m.groups)
 
-                instances_map[g_key]["dates"].append(d)
+                instances_map[g_key]["days"].append(day_name)
+                instances_map[g_key]["day_indices"].append(di)
                 instances_map[g_key]["start_times"].append(slot_time)
                 instances_map[g_key]["rooms"].append(room_id)
                 instances_map[g_key]["instructors"].append(chosen_insts)
 
             sessions_output: list[CourseSchedule.ComponentOutput.SessionSeries] = []
             for g_key, data in instances_map.items():
-                combined = list(zip(data["dates"], data["start_times"], data["rooms"], data["instructors"]))
-                combined.sort(key=lambda x: x[0])
+                combined = list(
+                    zip(
+                        data["day_indices"],
+                        data["days"],
+                        data["start_times"],
+                        data["rooms"],
+                        data["instructors"],
+                    )
+                )
+                combined.sort(key=lambda x: (x[0], x[2]))
 
                 sessions_output.append(
                     CourseSchedule.ComponentOutput.SessionSeries(
                         audience=list(g_key),
-                        instructors=[x[3] for x in combined],
-                        dates=[x[0] for x in combined],
-                        start_times=[x[1] for x in combined],
-                        rooms=[x[2] for x in combined],
+                        days=[x[1] for x in combined],
+                        start_times=[x[2] for x in combined],
+                        rooms=[x[3] for x in combined],
+                        instructors=[x[4] for x in combined],
                     )
                 )
 
@@ -1049,8 +1072,7 @@ def solve_schedule(
         stats=stats,
         artifacts_dir=artifacts_dir,
     )
-    save_output(artifacts_dir, result)
-    return result
+    return _save_and_return(result)
 
 
 def main():
@@ -1058,6 +1080,7 @@ def main():
     parser.add_argument("config", type=Path)
     parser.add_argument("--time-limit", type=int, default=60)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--artifacts-dir", type=Path, default=None)
     parser.add_argument("--no-progress", action="store_true")
 
     args = parser.parse_args()
@@ -1066,12 +1089,17 @@ def main():
 
     cfg = ScheduleConfig.from_yaml(args.config)
 
-    results_dir = _results_dir_for_run(cfg)
+    artifacts_dir = args.artifacts_dir
+    if artifacts_dir is None:
+        artifacts_dir = _results_dir_for_run(cfg)
+    else:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
     result = solve_schedule(
         cfg,
         args.time_limit,
         show_progress=not args.no_progress,
-        artifacts_dir=results_dir,
+        artifacts_dir=artifacts_dir,
         num_search_workers=args.num_workers,
     )
 
@@ -1082,7 +1110,7 @@ def main():
             allow_unicode=True,
         ).rstrip()
     )
-    schedule_path = results_dir / "output.yaml"
+    schedule_path = artifacts_dir / "output.yaml"
     print(f"Schedule written to {schedule_path.resolve()}", flush=True)
     if result.artifacts_dir is not None:
         phase_log_paths = sorted(result.artifacts_dir.glob("solver_log_phase_*.txt"))

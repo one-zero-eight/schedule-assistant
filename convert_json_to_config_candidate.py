@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 import yaml
+from config import TermConfig
 
 EXCLUDED_ROOM_IDS = {
     "1.1",
@@ -30,185 +31,315 @@ EXCLUDED_ROOM_IDS = {
     "309A",
 }
 
+def _program_code(program: dict[str, Any]) -> str:
+    return str(program.get("code") or program.get("id") or "").strip()
+
+
+def _group_entry_code(entry: Any) -> str:
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, dict):
+        return str(entry.get("code") or entry.get("id") or "").strip()
+    return ""
+
+
+# Mirrors `sections` hierarchy in config.py — track `groups` are plain group id strings.
 PROGRAMS: dict[str, list[dict[str, Any]]] = {
     "bachelor": [
         {
-            "id": "bachelor_1_en",
+            "code": "BS_Y1_EN",
             "name": "BS - Year 1 (EN)",
             "language": "en",
             "year": 1,
             "tracks": [
                 {
                     "name": "Computer Science and Engineering",
+                    "code": "CSE",
+                    "kind": "track",
                     "groups": [
-                        {"id": "B25-CSE-01", "size": 27},
-                        {"id": "B25-CSE-02", "size": 27},
-                        {"id": "B25-CSE-03", "size": 26},
-                        {"id": "B25-CSE-04", "size": 26},
-                        {"id": "B25-CSE-05", "size": 26},
+                        "B25-CSE-01",
+                        "B25-CSE-02",
+                        "B25-CSE-03",
+                        "B25-CSE-04",
+                        "B25-CSE-05",
                     ],
                 },
                 {
                     "name": "Data Science and Artificial Intelligence",
+                    "code": "DSAI",
+                    "kind": "track",
                     "groups": [
-                        {"id": "B25-DSAI-01", "size": 26},
-                        {"id": "B25-DSAI-02", "size": 25},
-                        {"id": "B25-DSAI-03", "size": 25},
-                        {"id": "B25-DSAI-04", "size": 25},
-                        {"id": "B25-DSAI-05", "size": 25},
+                        "B25-DSAI-01",
+                        "B25-DSAI-02",
+                        "B25-DSAI-03",
+                        "B25-DSAI-04",
+                        "B25-DSAI-05",
                     ],
                 },
             ],
         },
         {
-            "id": "bachelor_1_ru",
+            "code": "BS_Y1_RU",
             "name": "BS - Year 1 (RU)",
             "language": "ru",
             "year": 1,
             "tracks": [
-                {"name": "AI360", "groups": [{"id": "B25-AI360-01", "size": 18}]},
+                {
+                    "name": "AI360",
+                    "code": "AI360",
+                    "kind": "track",
+                    "groups": ["B25-AI360-01"],
+                },
                 {
                     "name": "MFAI",
+                    "code": "MFAI",
+                    "kind": "track",
                     "groups": [
-                        {"id": "B25-MFAI-01", "size": 18},
-                        {"id": "B25-MFAI-02", "size": 18},
-                        {"id": "B25-MFAI-03", "size": 18},
-                        {"id": "B25-MFAI-04", "size": 18},
-                        {"id": "B25-MFAI-05", "size": 18},
-                        {"id": "B25-MFAI-06", "size": 18},
-                        {"id": "B25-MFAI-07", "size": 30},
+                        "B25-MFAI-01",
+                        "B25-MFAI-02",
+                        "B25-MFAI-03",
+                        "B25-MFAI-04",
+                        "B25-MFAI-05",
+                        "B25-MFAI-06",
+                        "B25-MFAI-07",
                     ],
                 },
-                {"name": "Robotics", "groups": [{"id": "B25-RO-01", "size": 2}]},
+                {
+                    "name": "Robotics",
+                    "code": "RO",
+                    "kind": "track",
+                    "groups": ["B25-RO-01"],
+                },
             ],
         },
         {
-            "id": "bachelor_2_en",
+            "code": "BS_Y2_EN",
             "name": "BS - Year 2 (EN)",
             "language": "en",
             "year": 2,
             "tracks": [
                 {
                     "name": "Software Development",
-                    "groups": [
-                        {"id": "B24-SD-01", "size": 30},
-                        {"id": "B24-SD-02", "size": 30},
-                        {"id": "B24-SD-03", "size": 30},
-                    ],
+                    "code": "SD",
+                    "kind": "track",
+                    "groups": ["B24-SD-01", "B24-SD-02", "B24-SD-03"],
                 },
                 {
                     "name": "Cybersecurity",
-                    "groups": [
-                        {"id": "B24-CBS-01", "size": 30},
-                        {"id": "B24-CBS-02", "size": 30},
-                        {"id": "B24-CBS-03", "size": 30},
-                    ],
+                    "code": "CBS",
+                    "kind": "track",
+                    "groups": ["B24-CBS-01", "B24-CBS-02", "B24-CBS-03"],
                 },
-                {"name": "Data Science", "groups": [{"id": "B24-DS-01", "size": 28}]},
+                {
+                    "name": "Data Science",
+                    "code": "DS",
+                    "kind": "track",
+                    "groups": ["B24-DS-01"],
+                },
                 {
                     "name": "Artificial Intelligence",
-                    "groups": [
-                        {"id": "B24-AI-01", "size": 30},
-                        {"id": "B24-AI-02", "size": 30},
-                        {"id": "B24-AI-03", "size": 30},
-                    ],
+                    "code": "AI",
+                    "kind": "track",
+                    "groups": ["B24-AI-01", "B24-AI-02", "B24-AI-03"],
                 },
-                {"name": "Game Development", "groups": [{"id": "B24-GD-01", "size": 22}]},
-                {"name": "Robotics", "groups": [{"id": "B24-RO-01", "size": 10}]},
+                {
+                    "name": "Game Development",
+                    "code": "GD",
+                    "kind": "track",
+                    "groups": ["B24-GD-01"],
+                },
+                {
+                    "name": "Robotics",
+                    "code": "RO",
+                    "kind": "track",
+                    "groups": ["B24-RO-01"],
+                },
             ],
         },
         {
-            "id": "bachelor_2_ru",
+            "code": "BS_Y2_RU",
             "name": "BS - Year 2 (RU)",
             "language": "ru",
             "year": 2,
             "tracks": [
                 {
                     "name": "MFAI",
-                    "groups": [
-                        {"id": "B24-MFAI-01", "size": 20},
-                        {"id": "B24-MFAI-02", "size": 24},
-                        {"id": "B24-MFAI-03", "size": 22},
-                        {"id": "B24-MFAI-04", "size": 14},
-                    ],
+                    "code": "MFAI",
+                    "kind": "track",
+                    "groups": ["B24-MFAI-01", "B24-MFAI-02", "B24-MFAI-03", "B24-MFAI-04"],
                 },
-                {"name": "Robotics", "groups": [{"id": "B24-RO15-01", "size": 1}]},
-                {"name": "AI360", "groups": [{"id": "B24-AI360-01", "size": 10}]},
+                {
+                    "name": "Robotics",
+                    "code": "RO",
+                    "kind": "track",
+                    "groups": ["B24-RO15-01"],
+                },
+                {
+                    "name": "AI360",
+                    "code": "AI360",
+                    "kind": "track",
+                    "groups": ["B24-AI360-01"],
+                },
             ],
         },
         {
-            "id": "bachelor_3_en",
+            "code": "BS_Y3_EN",
             "name": "BS - Year 3 (EN)",
             "language": "en",
             "year": 3,
             "tracks": [
                 {
                     "name": "Software Development",
-                    "groups": [
-                        {"id": "B23-SD-01", "size": 30},
-                        {"id": "B23-SD-02", "size": 27},
-                        {"id": "B23-SD-03", "size": 25},
-                    ],
+                    "code": "SD",
+                    "kind": "track",
+                    "groups": ["B23-SD-01", "B23-SD-02", "B23-SD-03"],
                 },
                 {
                     "name": "Cybersecurity",
-                    "groups": [
-                        {"id": "B23-CBS-01", "size": 27},
-                        {"id": "B23-CBS-02", "size": 26},
-                    ],
+                    "code": "CBS",
+                    "kind": "track",
+                    "groups": ["B23-CBS-01", "B23-CBS-02"],
                 },
                 {
                     "name": "Artificial Intelligence",
-                    "groups": [
-                        {"id": "B23-AI-01", "size": 27},
-                        {"id": "B23-AI-02", "size": 24},
-                    ],
+                    "code": "AI",
+                    "kind": "track",
+                    "groups": ["B23-AI-01", "B23-AI-02"],
                 },
                 {
                     "name": "Data Science",
-                    "groups": [
-                        {"id": "B23-DS-01", "size": 24},
-                        {"id": "B23-DS-02", "size": 25},
-                    ],
+                    "code": "DS",
+                    "kind": "track",
+                    "groups": ["B23-DS-01", "B23-DS-02"],
                 },
-                {"name": "Game Development", "groups": [{"id": "B23-GD-01", "size": 16}]},
-                {"name": "Robotics", "groups": [{"id": "B23-RO-01", "size": 14}]},
+                {
+                    "name": "Game Development",
+                    "code": "GD",
+                    "kind": "track",
+                    "groups": ["B23-GD-01"],
+                },
+                {
+                    "name": "Robotics",
+                    "code": "RO",
+                    "kind": "track",
+                    "groups": ["B23-RO-01"],
+                },
             ],
         },
     ],
     "master": [
         {
-            "id": "master_1",
+            "code": "MS_Y1",
             "name": "MS - Year 1",
             "year": 1,
             "tracks": [
                 {
                     "name": "Software Engineering",
-                    "groups": [
-                        {"id": "M25-SE-01", "size": 15},
-                        {"id": "M25-SE-02", "size": 15},
-                    ],
+                    "code": "SE",
+                    "kind": "track",
+                    "groups": ["M25-SE-01", "M25-SE-02"],
                 },
-                {"name": "AIDE", "groups": [{"id": "M25-AIDE-01", "size": 27}]},
-                {"name": "Robotics", "groups": [{"id": "M25-RO-01", "size": 14}]},
-                {"name": "Technological Entrepreneurship", "groups": [{"id": "M25-TE-01", "size": 17}]},
-                {"name": "SNE", "groups": [{"id": "M25-SNE-01", "size": 21}]},
+                {
+                    "name": "AIDE",
+                    "code": "AIDE",
+                    "kind": "track",
+                    "groups": ["M25-AIDE-01"],
+                },
+                {
+                    "name": "Robotics",
+                    "code": "RO",
+                    "kind": "track",
+                    "groups": ["M25-RO-01"],
+                },
+                {
+                    "name": "Technological Entrepreneurship",
+                    "code": "TE",
+                    "kind": "track",
+                    "groups": ["M25-TE-01"],
+                },
+                {
+                    "name": "SNE",
+                    "code": "SNE",
+                    "kind": "track",
+                    "groups": ["M25-SNE-01"],
+                },
             ],
         }
     ],
     "phd": [
         {
-            "id": "phd",
-            "name": "PhD - 1 year",
+            "code": "PHD",
+            "name": "PhD",
             "year": 1,
             "tracks": [
                 {
                     "name": "PhD",
-                    "groups": [{"id": "PhD", "size": 25}],
+                    "code": "PHD",
+                    "kind": "track",
+                    "groups": ["PhD"],
                 },
             ],
         },
     ],
+}
+
+
+GROUP_ESTIMATED_SIZE: dict[str, int] = {
+    "B25-CSE-01": 27,
+    "B25-CSE-02": 27,
+    "B25-CSE-03": 26,
+    "B25-CSE-04": 26,
+    "B25-CSE-05": 26,
+    "B25-DSAI-01": 26,
+    "B25-DSAI-02": 25,
+    "B25-DSAI-03": 25,
+    "B25-DSAI-04": 25,
+    "B25-DSAI-05": 25,
+    "B25-AI360-01": 18,
+    "B25-MFAI-01": 18,
+    "B25-MFAI-02": 18,
+    "B25-MFAI-03": 18,
+    "B25-MFAI-04": 18,
+    "B25-MFAI-05": 18,
+    "B25-MFAI-06": 18,
+    "B25-MFAI-07": 30,
+    "B25-RO-01": 2,
+    "B24-SD-01": 30,
+    "B24-SD-02": 30,
+    "B24-SD-03": 30,
+    "B24-CBS-01": 30,
+    "B24-CBS-02": 30,
+    "B24-CBS-03": 30,
+    "B24-DS-01": 28,
+    "B24-AI-01": 30,
+    "B24-AI-02": 30,
+    "B24-AI-03": 30,
+    "B24-GD-01": 22,
+    "B24-RO-01": 10,
+    "B24-MFAI-01": 20,
+    "B24-MFAI-02": 24,
+    "B24-MFAI-03": 22,
+    "B24-MFAI-04": 14,
+    "B24-RO15-01": 1,
+    "B24-AI360-01": 10,
+    "B23-SD-01": 30,
+    "B23-SD-02": 27,
+    "B23-SD-03": 25,
+    "B23-CBS-01": 27,
+    "B23-CBS-02": 26,
+    "B23-AI-01": 27,
+    "B23-AI-02": 24,
+    "B23-DS-01": 24,
+    "B23-DS-02": 25,
+    "B23-GD-01": 16,
+    "B23-RO-01": 14,
+    "M25-SE-01": 15,
+    "M25-SE-02": 15,
+    "M25-AIDE-01": 27,
+    "M25-RO-01": 14,
+    "M25-TE-01": 17,
+    "M25-SNE-01": 21,
+    "PhD": 25,
 }
 
 
@@ -221,6 +352,9 @@ WEEKDAY_TO_SHORT = {
     "SATURDAY": "Sat",
     "SUNDAY": "Sun",
 }
+
+ELECTIVE_ALIAS_PREFIXES = ("spring-bs2", "spring-bs3", "spring26-bs2", "spring26-bs3")
+IGNORED_ELECTIVE_GROUP_IDS = {"spring26-bs3-tech-fbds"}
 
 CLASS_TAG_MAP = {
     "лаб": "lab",
@@ -236,6 +370,20 @@ CLASS_TAG_MAP = {
     "практика": "practice",
     "seminar": "sem",
 }
+
+def _default_term_days_from_config_class() -> list[str]:
+    return list(TermConfig.model_fields["days"].default)
+
+
+def _default_starting_day_from_config_class() -> str:
+    value = TermConfig.model_fields["starting_day"].default
+    return str(value) if value else "Mon"
+
+
+def _default_time_slots_from_config_class() -> list[str]:
+    default_slots = TermConfig.model_fields["time_slots"].default
+    return [slot.strftime("%H:%M") for slot in default_slots]
+
 
 @dataclass(frozen=True)
 class PatternKey:
@@ -286,9 +434,11 @@ def is_english_lesson(lesson_name: str) -> bool:
     return ("english" in name) or ("англий" in name) or ("иностран" in name) or ("foreign language" in name)
 
 
-def infer_course_tags(course_name: str) -> list[str]:
+def infer_course_tags(course_name: str, *, is_elective_course: bool = False) -> list[str]:
     if is_english_lesson(course_name):
         return ["english"]
+    if is_elective_course:
+        return ["elective"]
     return ["core_course"]
 
 
@@ -486,7 +636,7 @@ def load_english_distribution(
         group = by_id.setdefault(
             gid,
             {
-                "id": gid,
+                "code": gid,
                 "kind": "english",
                 "name": label,
                 "students": [],
@@ -502,7 +652,7 @@ def load_english_distribution(
             group_slots[gid].add((day, time_hhmm))
 
     shared_groups: list[dict[str, Any]] = []
-    for group in sorted(by_id.values(), key=lambda g: english_group_sort_key_from_id(str(g.get("id", "")))):
+    for group in sorted(by_id.values(), key=lambda g: english_group_sort_key_from_id(str(g.get("code") or g.get("id") or ""))):
         group["size"] = len(group["students"])
         shared_groups.append(group)
 
@@ -511,7 +661,7 @@ def load_english_distribution(
 
 
 def _track_group_ids(tracks: list[dict[str, Any]]) -> set[str]:
-    return {g["id"] for track in tracks for g in track.get("groups", []) if g.get("id")}
+    return {_group_entry_code(g) for track in tracks for g in track.get("groups", []) if _group_entry_code(g)}
 
 
 def _program_group_ids(program: dict[str, Any]) -> set[str]:
@@ -521,7 +671,7 @@ def _program_group_ids(program: dict[str, Any]) -> set[str]:
     if "extra_hierarchy" in program:
         groups.update(_track_group_ids(program.get("extra_hierarchy", [])))
     if "groups" in program:
-        groups.update({g["id"] for g in program.get("groups", []) if g.get("id")})
+        groups.update({_group_entry_code(g) for g in program.get("groups", []) if _group_entry_code(g)})
     return groups
 
 
@@ -529,7 +679,7 @@ def build_group_selectors(programs: dict[str, list[dict[str, Any]]]) -> dict[str
     selectors: dict[str, set[str]] = {}
     for level_programs in programs.values():
         for program in level_programs:
-            program_id = program.get("id")
+            program_id = _program_code(program)
             if not program_id:
                 continue
             program_groups = _program_group_ids(program)
@@ -539,14 +689,14 @@ def build_group_selectors(programs: dict[str, list[dict[str, Any]]]) -> dict[str
                 track_name = track.get("name")
                 if not track_name:
                     continue
-                track_groups = {g["id"] for g in track.get("groups", []) if g.get("id")}
+                track_groups = {_group_entry_code(g) for g in track.get("groups", []) if _group_entry_code(g)}
                 if track_groups:
                     selectors[f"@{program_id}/{track_name}"] = track_groups
             for track in program.get("extra_hierarchy", []):
                 track_name = track.get("name")
                 if not track_name:
                     continue
-                track_groups = {g["id"] for g in track.get("groups", []) if g.get("id")}
+                track_groups = {_group_entry_code(g) for g in track.get("groups", []) if _group_entry_code(g)}
                 if track_groups:
                     selectors[f"@{program_id}/{track_name}"] = track_groups
     return selectors
@@ -560,19 +710,19 @@ def build_group_order(programs: dict[str, list[dict[str, Any]]]) -> dict[str, in
             if "tracks" in program:
                 for track in program.get("tracks", []):
                     for group in track.get("groups", []):
-                        gid = group.get("id")
+                        gid = _group_entry_code(group)
                         if gid and gid not in order:
                             order[gid] = idx
                             idx += 1
             else:
                 for group in program.get("groups", []):
-                    gid = group.get("id")
+                    gid = _group_entry_code(group)
                     if gid and gid not in order:
                         order[gid] = idx
                         idx += 1
             for track in program.get("extra_hierarchy", []):
                 for group in track.get("groups", []):
-                    gid = group.get("id")
+                    gid = _group_entry_code(group)
                     if gid and gid not in order:
                         order[gid] = idx
                         idx += 1
@@ -587,28 +737,34 @@ def collect_academic_groups(programs: dict[str, list[dict[str, Any]]]) -> list[d
             if "tracks" in program:
                 for track in program.get("tracks", []):
                     for g in track.get("groups", []):
-                        gid = g.get("id")
+                        gid = _group_entry_code(g)
                         if not gid or gid in seen:
                             continue
                         seen.add(gid)
+                        est = GROUP_ESTIMATED_SIZE.get(gid)
+                        if est is None and isinstance(g, dict):
+                            est = g.get("estimated_size", g.get("size"))
                         out.append(
                             {
-                                "id": gid,
+                                "code": gid,
                                 "name": gid,
-                                "estimated_size": g.get("size"),
+                                "estimated_size": est,
                             }
                         )
             else:
                 for g in program.get("groups", []):
-                    gid = g.get("id")
+                    gid = _group_entry_code(g)
                     if not gid or gid in seen:
                         continue
                     seen.add(gid)
+                    est = GROUP_ESTIMATED_SIZE.get(gid)
+                    if est is None and isinstance(g, dict):
+                        est = g.get("estimated_size", g.get("size"))
                     out.append(
                         {
-                            "id": gid,
+                            "code": gid,
                             "name": gid,
-                            "estimated_size": g.get("size"),
+                            "estimated_size": est,
                         }
                     )
     return out
@@ -618,37 +774,51 @@ def enrich_academic_groups_from_predefined(
     academic_groups: list[dict[str, Any]],
     predefined_json_path: Path,
 ) -> list[dict[str, Any]]:
-    ordered_ids = [g["id"] for g in academic_groups if g.get("id")]
+    def _row_code(row: dict[str, Any]) -> str:
+        return str(row.get("code") or row.get("id") or "").strip()
+
+    ordered_ids = [_row_code(g) for g in academic_groups if _row_code(g)]
     if not predefined_json_path.exists():
-        return [g for g in academic_groups if g.get("id")]
+        return [g for g in academic_groups if _row_code(g)]
 
     try:
         payload = json.loads(predefined_json_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return [g for g in academic_groups if g.get("id")]
+        return [g for g in academic_groups if _row_code(g)]
 
     predefined = payload.get("academic_groups")
     if not isinstance(predefined, list):
-        return [g for g in academic_groups if g.get("id")]
+        return [g for g in academic_groups if _row_code(g)]
 
-    by_id: dict[str, dict[str, Any]] = {g["id"]: dict(g) for g in academic_groups if g.get("id")}
+    by_id: dict[str, dict[str, Any]] = {_row_code(g): dict(g) for g in academic_groups if _row_code(g)}
     for item in predefined:
         if not isinstance(item, dict):
             continue
         gid = str(item.get("name") or "").strip()
         if not gid:
             continue
-        if gid not in by_id:
-            # Keep academic groups bounded to groups present in programs.
+        if gid.lower() in IGNORED_ELECTIVE_GROUP_IDS:
             continue
+        alias = str(item.get("event_group_alias") or "").strip().lower()
         students_raw = item.get("user_emails")
         students = []
         if isinstance(students_raw, list):
             students = [str(email).strip().lower() for email in students_raw if str(email).strip()]
 
+        if gid not in by_id:
+            if alias.startswith(ELECTIVE_ALIAS_PREFIXES):
+                by_id[gid] = {
+                    "code": gid,
+                    "name": gid,
+                    "students": students,
+                    "estimated_size": len(students) if students else None,
+                }
+                ordered_ids.append(gid)
+            continue
+
         existing = by_id[gid]
         merged = dict(existing)
-        merged["id"] = gid
+        merged["code"] = gid
         merged["name"] = existing.get("name") or gid
         merged["students"] = students
         merged["estimated_size"] = len(students) if students else existing.get("estimated_size")
@@ -657,31 +827,157 @@ def enrich_academic_groups_from_predefined(
     return [by_id[gid] for gid in ordered_ids if gid in by_id]
 
 
-def simplify_program_group_refs(programs: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
-    simplified: dict[str, list[dict[str, Any]]] = {}
-    for level, level_programs in programs.items():
-        out_programs: list[dict[str, Any]] = []
-        for program in level_programs:
-            p = dict(program)
-            if "tracks" in p:
-                tracks_out: list[dict[str, Any]] = []
-                for track in p.get("tracks", []):
-                    t = dict(track)
-                    t["groups"] = [g["id"] for g in track.get("groups", []) if g.get("id")]
-                    tracks_out.append(t)
-                p["tracks"] = tracks_out
-            if "extra_hierarchy" in p:
-                extra_out: list[dict[str, Any]] = []
-                for track in p.get("extra_hierarchy", []):
-                    t = dict(track)
-                    t["groups"] = [g["id"] for g in track.get("groups", []) if g.get("id")]
-                    extra_out.append(t)
-                p["extra_hierarchy"] = extra_out
-            elif "groups" in p:
-                p["groups"] = [g["id"] for g in p.get("groups", []) if g.get("id")]
-            out_programs.append(p)
-        simplified[level] = out_programs
-    return simplified
+def _slug_code(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", str(value or "").strip().lower())
+    return cleaned.strip("_") or "item"
+
+
+def _track_code_fallback(track_name: str) -> str:
+    return _slug_code(track_name).upper()
+
+
+def _elective_bucket_for_group(group_id: str) -> str | None:
+    normalized = str(group_id or "").strip().lower()
+    if not normalized:
+        return None
+    if "bs2" in normalized and ("rus" in normalized or "ru" in normalized):
+        return "BS2_RU"
+    if "bs3" in normalized and "tech" in normalized:
+        return "BS3_TECH"
+    return None
+
+
+ENGLISH_LEVEL_TRACK_CODE = {
+    "AWA-I": "AWA_I",
+    "EAP": "EAP",
+    "FL": "FL",
+    "Other": "OTHER",
+}
+
+
+def build_sections(
+    programs: dict[str, list[dict[str, Any]]],
+    english_groups: list[dict[str, Any]],
+    elective_group_ids: set[str],
+) -> list[dict[str, Any]]:
+    degree_by_level = {"bachelor": "bs", "master": "ms", "phd": "phd"}
+    core_programs: list[dict[str, Any]] = []
+    for level_name in ("bachelor", "master", "phd"):
+        for program in programs.get(level_name, []):
+            tracks = []
+            for track in program.get("tracks", []):
+                track_name = track.get("name", "")
+                track_groups = [g for g in track.get("groups", []) if _group_entry_code(g)]
+                tracks.append(
+                    {
+                        "code": str(track.get("code") or _track_code_fallback(track_name)),
+                        "name": track.get("name"),
+                        "kind": str(track.get("kind") or "track"),
+                        "groups": track_groups,
+                    }
+                )
+            core_programs.append(
+                {
+                    "code": _program_code(program),
+                    "name": program.get("name"),
+                    "kind": "degree_year",
+                    "degree": degree_by_level.get(level_name),
+                    "language": program.get("language"),
+                    "year": program.get("year"),
+                    "tracks": tracks,
+                }
+            )
+
+    grouped: dict[str, list[dict[str, Any]]] = {"AWA-I": [], "EAP": [], "FL": [], "Other": []}
+    for group in english_groups:
+        gid = group.get("code") or group.get("id")
+        if not gid:
+            continue
+        gid_lower = str(gid).lower()
+        key = "Other"
+        if gid_lower.startswith("eng-awa_i_"):
+            key = "AWA-I"
+        elif gid_lower.startswith("eng-eap"):
+            key = "EAP"
+        elif gid_lower.startswith("eng-fl"):
+            key = "FL"
+        grouped[key].append(group)
+
+    english_tracks: list[dict[str, Any]] = []
+    for track_name in ("AWA-I", "EAP", "FL", "Other"):
+        items = sorted(
+            grouped[track_name],
+            key=lambda item: english_group_sort_key_from_id(str(item.get("code") or item.get("id") or "")),
+        )
+        if not items:
+            continue
+        english_tracks.append(
+            {
+                "code": ENGLISH_LEVEL_TRACK_CODE.get(track_name, _track_code_fallback(track_name)),
+                "name": track_name,
+                "kind": "english_level",
+                "groups": [str(item.get("code") or item.get("id")) for item in items],
+            }
+        )
+
+    sections: list[dict[str, Any]] = [
+        {"code": "core", "name": "Основные курсы", "kind": "core", "programs": core_programs},
+    ]
+    if english_tracks:
+        sections.append(
+            {
+                "code": "english",
+                "name": "Английский",
+                "kind": "english",
+                "programs": [
+                    {
+                        "code": "ENGLISH_YEAR1",
+                        "name": "English",
+                        "kind": "english_program",
+                        "applies_to": ["BS_Y1_EN", "BS_Y1_RU"],
+                        "tracks": english_tracks,
+                    }
+                ],
+            }
+        )
+    if elective_group_ids:
+        elective_buckets: dict[str, list[str]] = {"BS2_RU": [], "BS3_TECH": []}
+        for group_id in sorted(elective_group_ids):
+            bucket = _elective_bucket_for_group(group_id)
+            if bucket is None:
+                continue
+            elective_buckets[bucket].append(group_id)
+
+        elective_programs: list[dict[str, Any]] = []
+        if elective_buckets["BS2_RU"]:
+            elective_programs.append(
+                {
+                    "code": "BS2_RU",
+                    "name": "BS2 Ru",
+                    "kind": "elective_bucket",
+                    "groups": list(elective_buckets["BS2_RU"]),
+                }
+            )
+        if elective_buckets["BS3_TECH"]:
+            elective_programs.append(
+                {
+                    "code": "BS3_TECH",
+                    "name": "BS3 Tech",
+                    "kind": "elective_bucket",
+                    "groups": list(elective_buckets["BS3_TECH"]),
+                }
+            )
+
+        if elective_programs:
+            sections.append(
+                {
+                    "code": "electives",
+                    "name": "Элективы",
+                    "kind": "electives",
+                    "programs": elective_programs,
+                }
+            )
+    return sections
 
 
 def attach_english_to_programs(
@@ -692,10 +988,10 @@ def attach_english_to_programs(
     grouped: dict[str, list[dict[str, Any]]] = {"AWA-I": [], "EAP": [], "FL": [], "Other": []}
 
     for group in english_groups:
-        gid = group.get("id")
+        gid = group.get("code") or group.get("id")
         if not gid:
             continue
-        item = {"id": gid, "size": group.get("size")}
+        item = {"code": gid, "size": group.get("size")}
         gid_lower = str(gid).lower()
         if gid_lower.startswith("eng-awa_i_"):
             grouped["AWA-I"].append(item)
@@ -708,15 +1004,25 @@ def attach_english_to_programs(
 
     tracks: list[dict[str, Any]] = []
     for track_name in ("AWA-I", "EAP", "FL", "Other"):
-        groups = sorted(grouped[track_name], key=lambda item: english_group_sort_key_from_id(str(item.get("id", ""))))
+        groups = sorted(
+            grouped[track_name],
+            key=lambda item: english_group_sort_key_from_id(str(item.get("code") or item.get("id") or "")),
+        )
         if groups:
-            tracks.append({"name": track_name, "groups": groups})
+            tracks.append(
+                {
+                    "name": track_name,
+                    "code": ENGLISH_LEVEL_TRACK_CODE.get(track_name, _track_code_fallback(track_name)),
+                    "kind": "english_level",
+                    "groups": groups,
+                }
+            )
 
     if tracks:
         enriched["english"] = [
             {
-                "id": "english",
-                "name": "English Program (Year 1)",
+                "code": "ENGLISH_YEAR1",
+                "name": "English",
                 "language": "en",
                 "tracks": tracks,
             }
@@ -731,8 +1037,8 @@ def build_group_buckets(
 ) -> dict[str, list[dict[str, Any]]]:
     english_clean = [
         {
-            "id": group["id"],
-            "name": group.get("name", group["id"]),
+            "code": group.get("code") or group.get("id"),
+            "name": group.get("name", group.get("code") or group.get("id")),
             "estimated_size": group.get("size"),
             "students": group.get("students", []),
         }
@@ -740,10 +1046,51 @@ def build_group_buckets(
     ]
     return {
         "academic": academic_groups,
-        "english": sorted(english_clean, key=lambda g: english_group_sort_key_from_id(str(g.get("id", "")))),
+        "english": sorted(
+            english_clean,
+            key=lambda g: english_group_sort_key_from_id(str(g.get("code") or g.get("id") or "")),
+        ),
         # Filled when elective groups are introduced. Keep schema explicit now.
         "elective": [],
     }
+
+
+def build_students_groups(
+    academic_groups: list[dict[str, Any]],
+    english_groups: list[dict[str, Any]],
+    elective_group_ids: set[str],
+) -> list[dict[str, Any]]:
+    distribution: list[dict[str, Any]] = []
+    for group in academic_groups:
+        gid = group.get("code") or group.get("id")
+        if not gid:
+            continue
+        distribution.append(
+            {
+                "code": gid,
+                "kind": "elective" if gid in elective_group_ids else "core",
+                "name": group.get("name", gid),
+                "estimated_size": group.get("estimated_size"),
+                "students": group.get("students", []),
+            }
+        )
+    for group in sorted(
+        english_groups,
+        key=lambda g: english_group_sort_key_from_id(str(g.get("code") or g.get("id") or "")),
+    ):
+        gid = group.get("code") or group.get("id")
+        if not gid:
+            continue
+        distribution.append(
+            {
+                "code": gid,
+                "kind": "english",
+                "name": group.get("name", gid),
+                "estimated_size": group.get("size"),
+                "students": group.get("students", []),
+            }
+        )
+    return distribution
 
 
 def compress_groups_to_selectors(
@@ -833,6 +1180,50 @@ def output_path_for_block(base_output: Path, block_key: str) -> Path:
     return base_output.with_name(f"{base_output.stem}-{block_key}{base_output.suffix}")
 
 
+def _row_is_elective(row: dict[str, Any]) -> bool:
+    alias_fields = (
+        "event_group_alias",
+        "group_alias",
+        "event_group",
+    )
+    aliases: list[str] = []
+    for field in alias_fields:
+        value = row.get(field)
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned:
+                aliases.append(cleaned)
+        elif isinstance(value, list):
+            aliases.extend(str(item).strip().lower() for item in value if str(item).strip())
+        elif isinstance(value, dict):
+            aliases.extend(str(item).strip().lower() for item in value.values() if str(item).strip())
+    return any(alias.startswith(ELECTIVE_ALIAS_PREFIXES) for alias in aliases)
+
+
+def _load_elective_group_ids_from_predefined(predefined_json_path: Path) -> set[str]:
+    if not predefined_json_path.exists():
+        return set()
+    try:
+        payload = json.loads(predefined_json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return set()
+    predefined = payload.get("academic_groups")
+    if not isinstance(predefined, list):
+        return set()
+
+    out: set[str] = set()
+    for item in predefined:
+        if not isinstance(item, dict):
+            continue
+        alias = str(item.get("event_group_alias") or "").strip().lower()
+        if not alias.startswith(ELECTIVE_ALIAS_PREFIXES):
+            continue
+        gid = str(item.get("name") or "").strip()
+        if gid and gid.lower() not in IGNORED_ELECTIVE_GROUP_IDS:
+            out.add(gid)
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert core-courses-lessons JSON into config-candidate.yaml")
     parser.add_argument("input_json", type=Path)
@@ -860,6 +1251,16 @@ def main() -> None:
     rows: list[dict[str, Any]] = json.loads(args.input_json.read_text(encoding="utf-8"))
     if not rows:
         raise ValueError("Input JSON is empty")
+    elective_group_ids: set[str] = set()
+    for row in rows:
+        if not _row_is_elective(row):
+            continue
+        group_field = row.get("group_name")
+        groups = group_field if isinstance(group_field, list) else [group_field]
+        for group in groups:
+            group_id = str(group or "").strip()
+            if group_id and group_id.lower() not in IGNORED_ELECTIVE_GROUP_IDS:
+                elective_group_ids.add(group_id)
 
     block_rows: dict[str, list[dict[str, Any]]] = {"block1": [], "block2": []}
     unclassified_rows: list[dict[str, Any]] = []
@@ -885,6 +1286,7 @@ def main() -> None:
         candidate = args.input_json.parent / predefined_json_path
         if candidate.exists():
             predefined_json_path = candidate
+    elective_group_ids.update(_load_elective_group_ids_from_predefined(predefined_json_path))
     rooms = load_rooms(rooms_json_path)
 
     (
@@ -895,10 +1297,10 @@ def main() -> None:
         english_group_per_week,
     ) = load_english_distribution(distribution_path)
     programs = attach_english_to_programs(PROGRAMS, shared_groups)
-    simplified_programs = simplify_program_group_refs(programs)
     academic_groups = collect_academic_groups(PROGRAMS)
     academic_groups = enrich_academic_groups_from_predefined(academic_groups, predefined_json_path)
-    groups_bucket = build_group_buckets(academic_groups, shared_groups)
+    sections = build_sections(PROGRAMS, shared_groups, elective_group_ids)
+    students_groups = build_students_groups(academic_groups, shared_groups, elective_group_ids)
 
     instructors_map: dict[str, str] = {}
     aggregated: dict[PatternKey, dict[str, Any]] = {}
@@ -1222,23 +1624,36 @@ def main() -> None:
             for iid, name in sorted(instructors_map.items())
         ]
 
+        course_items = []
+        for course_name, components in sorted(courses_map.items()):
+            direct_group_tokens = {
+                token
+                for component in components
+                for token in component.get("student_groups", [])
+                if isinstance(token, str) and not token.startswith("@")
+            }
+            is_elective_course = bool(direct_group_tokens) and direct_group_tokens.issubset(elective_group_ids)
+            course_items.append(
+                {
+                    "name": course_name,
+                    "course_tags": infer_course_tags(course_name, is_elective_course=is_elective_course),
+                    "components": components,
+                }
+            )
+
         return {
             "term": {
                 "name": "Spring 2026",
                 "semester": {"start_date": global_start, "end_date": global_end},
+                "days": _default_term_days_from_config_class(),
+                "starting_day": _default_starting_day_from_config_class(),
+                "time_slots": _default_time_slots_from_config_class(),
             },
             "rooms": rooms,
             "instructors": instructors,
-            "programs": simplified_programs,
-            "student_groups": groups_bucket,
-            "courses": [
-                {
-                    "name": course_name,
-                    "course_tags": infer_course_tags(course_name),
-                    "components": components,
-                }
-                for course_name, components in sorted(courses_map.items())
-            ],
+            "sections": sections,
+            "students_groups": students_groups,
+            "courses": course_items,
         }
 
     if block_rows["block1"] and block_rows["block2"]:
