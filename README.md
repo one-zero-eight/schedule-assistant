@@ -20,37 +20,55 @@ uv run convert_json_to_config_candidate.py core-courses-lessons-spring-2026.json
 ```
 
 ```bash
-uv run python tests/cases/generate_cases.py
+uv run tests/cases/generate_cases.py
 ```
 
 ## Run the solver (`main.py`)
 
 ```bash
-uv run python main.py tests/cases/feasible_by_program_year_block1/core_year_1.yaml --time-limit 60
+uv run main.py tests/cases/feasible_by_program_year_block1/core_year_1.yaml
 ```
+
+Usage:
+```txt
+dante@dante-pc:~/PycharmProjects/schedule-assistant$ uv run main.py --help
+usage: main.py [-h] [--time-limit TIME_LIMIT] [--num-workers NUM_WORKERS] [--artifacts-dir ARTIFACTS_DIR] [--no-progress] config
+
+positional arguments:
+  config
+
+options:
+  -h, --help            show this help message and exit
+  --time-limit TIME_LIMIT
+  --num-workers NUM_WORKERS
+  --artifacts-dir ARTIFACTS_DIR
+  --no-progress
+```
+
 
 **Output:** prints `status` and `stats` to stdout. Writes the full result to:
 
-`results/<YYYY-mm-dd_HH-MM-SS>_<term-slug>/output.yaml`
+`results/<YYYY-mm-dd_HH-MM-SS>_<term-slug>/output.yaml` or `--artifacts-dir <path>`
 
 Solver phase logs may appear as `solver_log_phase_*.txt` in that same folder.
+
+For experiments better to pass `--artifacts-dir <path>` to avoid clobbering the default `results/` directory and to be able to run several experiments in parallel.
 
 ## Check metrics (`metrics.py`)
 
 Compares the **config** with a **solver output** and prints a human-readable report (conflicts, soft-constraint satisfaction, loads, room use, etc.).
 
 ```bash
-uv run python metrics.py \
-  --config tests/cases/feasible_one_week_full_with_english_block1/all_bachelors_masters_phd_with_english.yaml \
+uv run metrics.py \
+  --config tests/cases/feasible_by_program_year_block1/core_year_1.yaml \
   --solution "$(ls -1t results/*/output.yaml | head -n1)"
-  --short
 ```
 
 For machine-readable output:
 
 ```bash
-uv run python metrics.py \
-  --config tests/cases/feasible_one_week_full_with_english_block1/all_bachelors_masters_phd_with_english.yaml \
+uv run metrics.py \
+  --config tests/cases/feasible_by_program_year_block1/core_year_1.yaml \
   --solution results/<timestamp>_<term-slug>/output.yaml \
   --json
 ```

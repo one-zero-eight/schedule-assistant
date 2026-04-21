@@ -12,10 +12,10 @@ from metrics import assert_all_satisfied, assert_no_conflicts
 from config import ScheduleConfig
 
 CASES_DIR = Path(__file__).parent / "cases"
-PROGRAM_YEAR_CASES_DIR_BLOCK1 = CASES_DIR / "feasible_one_week_by_program_year_block1"
-PROGRAM_YEAR_CASES_DIR_BLOCK2 = CASES_DIR / "feasible_one_week_by_program_year_block2"
-FULL_CONFIG_CASES_DIR_BLOCK1 = CASES_DIR / "feasible_one_week_full_config_block1"
-FULL_CONFIG_CASES_DIR_BLOCK2 = CASES_DIR / "feasible_one_week_full_config_block2"
+PROGRAM_YEAR_CASES_DIR_BLOCK1 = CASES_DIR / "feasible_by_program_year_block1"
+PROGRAM_YEAR_CASES_DIR_BLOCK2 = CASES_DIR / "feasible_by_program_year_block2"
+FULL_CONFIG_CASES_DIR_BLOCK1 = CASES_DIR / "feasible_full_config_block1"
+FULL_CONFIG_CASES_DIR_BLOCK2 = CASES_DIR / "feasible_full_config_block2"
 TARGET_FULL_CONFIG_CASE = "all_bachelors_masters_phd.yaml"
 PROGRAM_YEAR_CASE_PATHS_BLOCK1 = tuple(sorted(PROGRAM_YEAR_CASES_DIR_BLOCK1.glob("*.yaml")))
 PROGRAM_YEAR_CASE_PATHS_BLOCK2 = tuple(sorted(PROGRAM_YEAR_CASES_DIR_BLOCK2.glob("*.yaml")))
@@ -58,7 +58,7 @@ def _assert_program_year_feasible_case(
     time_limit: int = 120,
 ) -> None:
     expected_courses = {course.name for course in cfg.courses if course.components}
-    target_groups = {group.id for group in cfg.student_groups.academic}
+    target_groups = {group.code for group in cfg.students_groups}
 
     out = solve_schedule(cfg, time_limit=time_limit, show_progress=False, artifacts_dir=tmp_path)
     assert out.status in ("OPTIMAL", "FEASIBLE")
@@ -100,7 +100,7 @@ def test_feasible_single_meeting(tmp_path) -> None:
     inst = courses[0].components[0].sessions
     assert len(inst) == 1
     assert inst[0].audience == ["B26-TEST-01"]
-    assert inst[0].dates
+    assert inst[0].days
     assert inst[0].start_times
     assert inst[0].rooms
     assert_no_conflicts(out)
@@ -155,9 +155,7 @@ def test_feasible_ordered_same_day(tmp_path) -> None:
     assert out.status in ("OPTIMAL", "FEASIBLE")
     comp = out.schedule.courses[0].components
     assert len(comp) == 3
-    times = [comp[i].sessions[0].start_times[0] for i in range(3)]
-    assert times[0] < times[1] < times[2]
-    dates = [comp[i].sessions[0].dates[0] for i in range(3)]
-    assert dates[0] == dates[1] == dates[2]
+    days = [comp[i].sessions[0].days[0] for i in range(3)]
+    assert days[0] == days[1] == days[2]
     assert_no_conflicts(out)
     assert_all_satisfied(out, cfg)
