@@ -116,6 +116,7 @@ import argparse
 import datetime
 import json
 import math
+import sys
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -215,24 +216,21 @@ def _is_consecutive(a: FlatMeeting, b: FlatMeeting, time_slots: list[datetime.ti
     return ia is not None and ib is not None and ib == ia + 1
 
 
-def _lec_tut_same_room_stats(events: list[FlatMeeting], time_slots: list[datetime.time]) -> tuple[int, int]:
-    by_key: dict[tuple[str, str, tuple[str, ...]], list[FlatMeeting]] = defaultdict(list)
+def _lec_tut_same_room_stats(events: list[FlatMeeting], cfg: ScheduleConfig) -> tuple[int, int]:
+    opportunities = _back_to_back_lecture_tutorial_opportunities(cfg)
+    tuts_by_start_room: dict[tuple[int, tuple[str, ...], str, datetime.time, str], set[int]] = defaultdict(set)
+    same_room_pairs: set[tuple[int, int, int]] = set()
     for e in events:
-        if str(e.component_tag).lower() in {"lec", "tut"}:
-            by_key[(e.day, e.course, e.groups)].append(e)
-    opportunities = 0
-    same_room = 0
-    for evs in by_key.values():
-        evs.sort(key=lambda x: x.start_time)
-        for a, b in zip(evs, evs[1:]):
-            a_tag = str(a.component_tag).lower()
-            b_tag = str(b.component_tag).lower()
-            is_pair = (a_tag == "lec" and b_tag == "tut") or (a_tag == "tut" and b_tag == "lec")
-            if is_pair and _is_consecutive(a, b, time_slots):
-                opportunities += 1
-                if a.room == b.room:
-                    same_room += 1
-    return opportunities, same_room
+        if str(e.component_tag).lower() == "tut":
+            key = (e.course_idx, e.groups, e.day, e.start_time, e.room)
+            tuts_by_start_room[key].add(e.component_idx)
+    for e in events:
+        if str(e.component_tag).lower() != "lec":
+            continue
+        key = (e.course_idx, e.groups, e.day, _slot_end(e.start_time), e.room)
+        for tut_component_idx in tuts_by_start_room.get(key, set()):
+            same_room_pairs.add((e.course_idx, e.component_idx, tut_component_idx))
+    return opportunities, len(same_room_pairs)
 
 
 def _instructor_room_swaps_consecutive(
@@ -315,32 +313,29 @@ def _meeting_expected_students(comp_cfg: CourseConfig.Component, groups: tuple[s
 
 
 def _back_to_back_lecture_tutorial_opportunities(cfg: ScheduleConfig) -> int:
-    selector_map = resolve_selector_map(cfg)
     total = 0
     for course in cfg.courses:
-        for i in range(len(course.components) - 1):
-            a, b = course.components[i], course.components[i + 1]
-            if str(a.tag).lower() != "lec" or str(b.tag).lower() != "tut":
-                continue
-            a_groups = expand_groups(a.student_groups, selector_map)
-            b_groups = expand_groups(b.student_groups, selector_map)
-            a_aud = {tuple([g]) for g in a_groups} if a.per_group else {tuple(a_groups)}
-            b_aud = {tuple([g]) for g in b_groups} if b.per_group else {tuple(b_groups)}
-            total += len(a_aud & b_aud) * min(a.per_week, b.per_week)
+        lecs = sum(1 for c in course.components if str(c.tag).lower() == "lec")
+        tuts = sum(1 for c in course.components if str(c.tag).lower() == "tut")
+        total += lecs * tuts
     return total
 
 
 def _back_to_back_lecture_tutorial_scheduled(events: list[FlatMeeting]) -> int:
-    lec_targets: dict[tuple[int, tuple[str, ...], str, str, datetime.time], int] = defaultdict(int)
-    tuts: dict[tuple[int, tuple[str, ...], str, str, datetime.time], int] = defaultdict(int)
+    tuts_by_start: dict[tuple[int, tuple[str, ...], str, datetime.time], set[int]] = defaultdict(set)
+    satisfied_pairs: set[tuple[int, int, int]] = set()
     for e in events:
-        key = (e.course_idx, e.groups, e.day, e.room, e.start_time)
         tag = str(e.component_tag).lower()
-        if tag == "lec":
-            lec_targets[(e.course_idx, e.groups, e.day, e.room, _slot_end(e.start_time))] += 1
-        elif tag == "tut":
-            tuts[key] += 1
-    return sum(min(n, tuts.get(k, 0)) for k, n in lec_targets.items())
+        if tag == "tut":
+            key = (e.course_idx, e.groups, e.day, e.start_time)
+            tuts_by_start[key].add(e.component_idx)
+    for e in events:
+        if str(e.component_tag).lower() != "lec":
+            continue
+        tut_key = (e.course_idx, e.groups, e.day, _slot_end(e.start_time))
+        for tut_component_idx in tuts_by_start.get(tut_key, set()):
+            satisfied_pairs.add((e.course_idx, e.component_idx, tut_component_idx))
+    return len(satisfied_pairs)
 
 
 def _lec_tut_lab_rows(cfg: ScheduleConfig) -> list[tuple[int, int, int, int, str]]:
@@ -622,7 +617,7 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
             inst_excess_count += 1
 
     late_events = [e for e in events if _slot_end(e.start_time) > datetime.time(18, 0)]
-    lec_tut_same_room_opportunities, lec_tut_same_room_count = _lec_tut_same_room_stats(events, cfg.term.time_slots)
+    lec_tut_same_room_opportunities, lec_tut_same_room_count = _lec_tut_same_room_stats(events, cfg)
     (
         instructor_room_swaps_consecutive_opportunities,
         instructor_room_swaps_consecutive,
@@ -718,6 +713,36 @@ def _load_solution(path: Path) -> SolveResult:
     return SolveResult.model_validate(payload)
 
 
+def _latest_results_output_path(results_dir: Path) -> Path:
+    if not results_dir.exists() or not results_dir.is_dir():
+        raise FileNotFoundError(f"results directory not found: {results_dir}")
+
+    latest_dir: Path | None = None
+    latest_mtime = -1.0
+    for child in results_dir.iterdir():
+        if not child.is_dir():
+            continue
+        mtime = child.stat().st_mtime
+        if mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_dir = child
+
+    if latest_dir is None:
+        raise FileNotFoundError(f"no run directories found under: {results_dir}")
+
+    output_path = latest_dir / "output.yaml"
+    if not output_path.exists():
+        raise FileNotFoundError(f"latest run directory has no output.yaml: {latest_dir}")
+    return output_path
+
+
+def _resolve_solution_path(solution_path: Path | None) -> Path:
+    if solution_path is not None:
+        return solution_path
+    project_root = Path(__file__).resolve().parent
+    return _latest_results_output_path(project_root / "results")
+
+
 def _print_human_report(metrics: ScheduleMetrics) -> None:
     print("=== Schedule Metrics ===")
     print("Context / dataset:")
@@ -791,12 +816,18 @@ def _print_json_report(metrics: ScheduleMetrics) -> None:
 def cli_main() -> None:
     parser = argparse.ArgumentParser(description="Compute schedule metrics from config and solution YAML files.")
     parser.add_argument("--config", required=True, type=Path, help="Path to schedule config YAML.")
-    parser.add_argument("--solution", required=True, type=Path, help="Path to solver output YAML.")
+    parser.add_argument(
+        "--solution",
+        type=Path,
+        help="Path to solver output YAML. If omitted, uses latest results/*/output.yaml.",
+    )
     parser.add_argument("--json", action="store_true", help="Print metrics as JSON.")
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
-    result = _load_solution(args.solution)
+    solution_path = _resolve_solution_path(args.solution)
+    print(f"Using solution: {solution_path.relative_to(Path.cwd())}", file=sys.stderr)
+    result = _load_solution(solution_path)
     metrics = calculate_schedule_metrics(result, cfg)
     if args.json:
         _print_json_report(metrics)
