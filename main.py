@@ -56,6 +56,17 @@ def _results_dir_for_run(cfg: ScheduleConfig) -> Path:
     return out
 
 
+def _with_available_postfix(path: Path) -> Path:
+    """Return path, or ``path_#`` if it already exists."""
+    if not path.exists():
+        return path
+    for idx in range(1, 10_000):
+        candidate = path.parent / f"{path.name}_{idx}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not find free artifacts directory postfix for {path}")
+
+
 def save_output(artifacts_dir: Path | None, result: SolveResult) -> None:
     if artifacts_dir is None:
         return
@@ -238,21 +249,70 @@ def prepare_model(
     shared_students: set[str],
     show_progress: bool,
 ) -> tuple[PreparedModel | None, str | None]:
+    """Build the CP-SAT model.
+
+    Layout (top to bottom):
+      1. Per-meeting decision variables (day, local slot, absolute start/end).
+      2. No-overlap resources: groups, shared-student profiles, rooms, instructors.
+      3. Room assignment: `room_v` + reified bools channelled to optional intervals.
+      4. Instructor assignment: option bools channelled to `inst_choice` + optional intervals.
+
+    Returns `(None, reason)` if the instance is infeasible at build time
+    (e.g. no room fits a meeting's expected enrollment).
+    """
     model = cp_model.CpModel()
 
+    # --- Output var arrays (indexed by meeting position) ---------------------
     day_vars: list[cp_model.IntVar] = []
     local_start_vars: list[cp_model.IntVar] = []
     absolute_start_vars: list[cp_model.IntVar] = []
     absolute_end_vars: list[cp_model.IntVar] = []
     room_vars: list[cp_model.IntVar] = []
     inst_choice_vars: list[cp_model.IntVar] = []
+
+    # --- Resource → intervals for later no_overlap posting -------------------
+    # group_id      -> intervals of meetings attended by that group (mandatory).
+    # profile       -> intervals of meetings touching a unique shared-student profile.
+    # room_idx      -> intervals of meetings placed in that room (optional if >1 choice).
+    # instructor_id -> intervals of meetings assigned to that instructor (optional if >1 option).
     group_intervals: dict[str, list[cp_model.IntervalVar]] = defaultdict(list)
-    student_intervals: dict[str, list[cp_model.IntervalVar]] = defaultdict(list)
+    profile_intervals: dict[frozenset[str], list[cp_model.IntervalVar]] = defaultdict(list)
     room_intervals: dict[int, list[cp_model.IntervalVar]] = defaultdict(list)
     inst_to_intervals: dict[str, list[cp_model.IntervalVar]] = defaultdict(list)
 
     max_abs = num_days * slots_per_day
     fallback_attendance_ratio = 0.9
+
+    # ---------------------------------------------------------------
+    # Shared-student profiles.
+    #
+    # Any student belonging to >1 group creates a cross-group conflict: two
+    # meetings whose audiences share this student must not overlap. Students
+    # with identical group-membership sets yield identical no_overlap
+    # constraints, so we dedupe to one constraint per unique profile.
+    # `profiles_by_group[g]` lists every profile that contains group `g`;
+    # a meeting's intervals are added once per distinct profile it touches.
+    # ---------------------------------------------------------------
+    profiles_by_group: dict[str, list[frozenset[str]]] = defaultdict(list)
+    if shared_students:
+        student_to_groups: dict[str, set[str]] = defaultdict(set)
+        for group_id, members in group_students_map.items():
+            for s in members & shared_students:
+                student_to_groups[s].add(group_id)
+        unique_profiles: set[frozenset[str]] = {frozenset(gs) for gs in student_to_groups.values() if len(gs) > 1}
+        for profile in unique_profiles:
+            for group_id in profile:
+                profiles_by_group[group_id].append(profile)
+
+    # ---------------------------------------------------------------
+    # Feasible rooms per meeting.
+    #
+    # Rooms are eligible if capacity >= required_capacity. For very large
+    # meetings (>100) or when no room fits the full enrollment, we relax the
+    # required capacity to `fallback_attendance_ratio * students` to account
+    # for realistic attendance. Early-exit with a reason string if any meeting
+    # has no eligible room.
+    # ---------------------------------------------------------------
     feasible_room_indices_by_meeting: dict[int, list[int]] = {}
     for i, meeting in enumerate(meetings):
         students = meeting.expected_students
@@ -272,8 +332,15 @@ def prepare_model(
             return None, f"no feasible room for meeting {i}"
         feasible_room_indices_by_meeting[i] = feasible_rooms
 
+    # ===============================================================
+    # Meeting timing variables + group / profile intervals.
+    # ===============================================================
     for i, meeting in enumerate(meetings):
         dur = meeting.duration
+
+        # Timing decision vars. `abs_s = day * slots_per_day + local_s` links
+        # day/local-slot to a single absolute-start coordinate used by every
+        # no-overlap resource.
         day_v = model.new_int_var(0, num_days - 1, f"day_{i}")
         loc_lo = max(0, slots_per_day - dur)
         local_s = model.new_int_var(0, loc_lo, f"local_start_{i}")
@@ -289,17 +356,23 @@ def prepare_model(
         local_start_vars.append(local_s)
         absolute_start_vars.append(abs_s)
         absolute_end_vars.append(abs_e)
+
+        # Mandatory "core" interval shared by group- and profile-level conflicts.
         core = model.new_interval_var(abs_s, dur, abs_e, f"group_core_{i}")
         for group_id in meeting.groups:
             group_intervals[group_id].append(core)
-        if shared_students:
-            meeting_students: set[str] = set()
+        if profiles_by_group:
+            seen_profiles: set[frozenset[str]] = set()
             for group_id in meeting.groups:
-                meeting_students.update(group_students_map.get(group_id, set()))
-            for student in meeting_students:
-                if student in shared_students:
-                    student_intervals[student].append(core)
+                for profile in profiles_by_group.get(group_id, ()):
+                    if profile in seen_profiles:
+                        continue
+                    seen_profiles.add(profile)
+                    profile_intervals[profile].append(core)
 
+        # Room decision var: a constant when there's only one feasible room,
+        # otherwise a sparse-domain int var (the actual room is channelled to
+        # pick-bools in pass 2).
         feasible_room_indices = feasible_room_indices_by_meeting[i]
         if len(feasible_room_indices) == 1:
             room_v = model.new_constant(feasible_room_indices[0])
@@ -307,6 +380,8 @@ def prepare_model(
             room_v = model.new_int_var_from_domain(cp_model.Domain.FromValues(feasible_room_indices), f"room_{i}")
         room_vars.append(room_v)
 
+        # Instructor-option index: constant when there's only one option,
+        # otherwise linked to option bools in pass 3.
         n_opts = len(meeting.instructor_options)
         if n_opts > 1:
             inst_choice = model.new_int_var(0, n_opts - 1, f"inst_choice_{i}")
@@ -314,33 +389,59 @@ def prepare_model(
             inst_choice = model.new_constant(0)
         inst_choice_vars.append(inst_choice)
 
+    # ===============================================================
+    # Group & shared-student-profile no-overlap constraints.
+    # (Mandatory intervals -> CP-SAT's disjunctive propagator.)
+    # ===============================================================
     for ivals in tqdm(group_intervals.values(), desc="Group constraints", disable=not show_progress):
         if len(ivals) > 1:
             model.add_no_overlap(ivals)
-    for ivals in tqdm(student_intervals.values(), desc="Student constraints", disable=not show_progress):
+    for ivals in tqdm(profile_intervals.values(), desc="Profile constraints", disable=not show_progress):
         if len(ivals) > 1:
             model.add_no_overlap(ivals)
 
+    # ===============================================================
+    # Room assignment.
+    #
+    # Single-room case: attach a mandatory interval to the sole room.
+    # Multi-room case: create one pick-bool per feasible room, attach an
+    # optional interval gated by the bool, and channel room_v to the bools
+    # via a single linear sum (`room_v == Σ idx · b`) instead of per-room
+    # OnlyEnforceIf reifications.
+    # ===============================================================
     for i, meeting in enumerate(meetings):
         dur = meeting.duration
         abs_s, abs_e = absolute_start_vars[i], absolute_end_vars[i]
         feasible_room_indices = feasible_room_indices_by_meeting[i]
-        room_bools: dict[int, cp_model.BoolVarT] = {}
-        for room_idx in feasible_room_indices:
-            b = model.new_bool_var(f"room_pick_{i}_{room_idx}")
-            room_bools[room_idx] = b
-            model.add(room_vars[i] == room_idx).OnlyEnforceIf(b)
-            model.add(room_vars[i] != room_idx).OnlyEnforceIf(b.Not())
-            room_intervals[room_idx].append(
-                model.new_optional_interval_var(abs_s, dur, abs_e, b, f"room_iv_{i}_{room_idx}")
+        if len(feasible_room_indices) == 1:
+            only_idx = feasible_room_indices[0]
+            room_intervals[only_idx].append(
+                model.new_interval_var(abs_s, dur, abs_e, f"room_iv_{i}")
             )
-        if len(feasible_room_indices) > 1:
+        else:
+            room_bools = {
+                room_idx: model.new_bool_var(f"room_pick_{i}_{room_idx}") for room_idx in feasible_room_indices
+            }
+            for room_idx, b in room_bools.items():
+                room_intervals[room_idx].append(
+                    model.new_optional_interval_var(abs_s, dur, abs_e, b, f"room_iv_{i}_{room_idx}")
+                )
             model.add_exactly_one(room_bools.values())
+            model.add(room_vars[i] == sum(idx * b for idx, b in room_bools.items()))
 
     for room_idx in tqdm(range(len(room_ids)), desc="Room constraints", disable=not show_progress):
         if len(room_intervals[room_idx]) > 1:
             model.add_no_overlap(room_intervals[room_idx])
 
+    # ===============================================================
+    # Instructor assignment.
+    #
+    # Single-option case: every listed instructor attends unconditionally,
+    # so we attach a mandatory interval per (meeting, instructor).
+    # Multi-option case: create one bool per option, link `inst_choice` to
+    # those bools via `inst_choice == Σ k · opt_b[k]`, and attach one
+    # optional interval per (option, instructor) gated by the option bool.
+    # ===============================================================
     for i, meeting in enumerate(tqdm(meetings, desc="Instructor constraints", disable=not show_progress)):
         dur = meeting.duration
         abs_s, abs_e = absolute_start_vars[i], absolute_end_vars[i]
@@ -351,8 +452,7 @@ def prepare_model(
             continue
         opts_b = [model.new_bool_var(f"inst_opt_{i}_{k}") for k in range(n_opts)]
         model.add_exactly_one(opts_b)
-        for opt_idx, b in enumerate(opts_b):
-            model.add(inst_choice_vars[i] == opt_idx).OnlyEnforceIf(b)
+        model.add(inst_choice_vars[i] == sum(k * b for k, b in enumerate(opts_b)))
         for opt_idx, insts in enumerate(meeting.instructor_options):
             for inst in insts:
                 inst_to_intervals[inst].append(
@@ -676,7 +776,8 @@ def main():
     if artifacts_dir is None:
         artifacts_dir = _results_dir_for_run(cfg)
     else:
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        artifacts_dir = _with_available_postfix(artifacts_dir)
+        artifacts_dir.mkdir(parents=True, exist_ok=False)
 
     result = solve_schedule(
         cfg,
