@@ -26,7 +26,7 @@ uv run tests/cases/generate_cases.py
 ## Run the solver (`main.py`)
 
 ```bash
-uv run main.py tests/cases/feasible_by_program_year_block1/core_year_1.yaml
+uv run main.py tests/cases/feasible_by_program_year_block1/core_year_1.yaml --no-progress
 ```
 
 Usage:
