@@ -969,7 +969,7 @@ def _print_human_report(metrics: ScheduleMetrics) -> None:
         "- instructor hatred:\n"
         f"  - high-load days (> {INSTRUCTOR_DAILY_EVENT_THRESHOLD} events): days={metrics.hatred_instructor_bad_days_events_total}, instructors affected={metrics.hatred_instructor_with_bad_days_events_count}\n"
         f"  - excess active days: days={metrics.hatred_instructor_total_active_days_excess}, instructors affected={metrics.hatred_instructor_with_excess_day_count}\n"
-        f"  - room swaps on consecutive slots: {metrics.room_continuity_instructor_room_swaps_consecutive} from {metrics.room_continuity_instructor_room_swaps_consecutive_possible} possible, "
+        f"  - room swaps on consecutive class/lab slots: {metrics.room_continuity_instructor_room_swaps_consecutive} from {metrics.room_continuity_instructor_room_swaps_consecutive_possible} possible, "
         f"{metrics.room_continuity_instructor_room_swaps_consecutive_ratio * 100.0:.1f}% incidence"
     )
     print("======\n")
