@@ -113,6 +113,7 @@ class PreparedModel:
     room_vars: list[cp_model.IntVar]
     inst_choice_vars: list[cp_model.IntVar]
     day_bool_by_meeting: list[list[cp_model.IntVar]]
+    feasible_room_indices_by_meeting: dict[int, list[int]]
 
 
 @dataclass
@@ -136,7 +137,7 @@ class CourseSchedule(SettingBaseModel):
             day_indices: list[int] = []
             start_times: list[datetime.time] = []
             rooms: list[str] = []
-            instructors: list[list[str]] = []
+            instructors: list[str | list[str]] = []
 
             def sorted_by_time(self) -> Self:
                 combined = list(
@@ -598,6 +599,74 @@ def prepare_model(
             model.add(sat <= sum(day_triples))
             satisfied_bools.append(sat)
 
+    # --- Back-to-back lec -> tut coverage ---
+    # For each (course, lec_cls, tut_cls) pair, reward at least one
+    # (lec_meeting, tut_meeting) sharing a group where the tutorial starts in
+    # the slot immediately after the lecture (same day, consecutive slots).
+    # `same_room` is tracked as a secondary preference aggregated to the same
+    # pair granularity.
+    b2b_pair_rows: list[tuple[int, int, int]] = []
+    for course_idx, comps in course_components.items():
+        lecs = comps.get("lec", [])
+        tuts = comps.get("tut", [])
+        for lec_i in lecs:
+            for tut_i in tuts:
+                b2b_pair_rows.append((course_idx, lec_i, tut_i))
+
+    b2b_satisfied_bools: list[cp_model.IntVar] = []
+    b2b_same_room_bools: list[cp_model.IntVar] = []
+    if b2b_pair_rows:
+        meetings_by_cls: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for m_idx, m in enumerate(meetings):
+            meetings_by_cls[(m.course_idx, m.class_idx)].append(m_idx)
+
+        for r_idx, (c_idx, lec_cls, tut_cls) in enumerate(b2b_pair_rows):
+            lec_ms = meetings_by_cls.get((c_idx, lec_cls), [])
+            tut_ms = meetings_by_cls.get((c_idx, tut_cls), [])
+            if not lec_ms or not tut_ms:
+                continue
+            adj_pair_bools: list[cp_model.IntVar] = []
+            same_room_pair_bools: list[cp_model.IntVar] = []
+            for l_idx in lec_ms:
+                l_m = meetings[l_idx]
+                l_groups = set(l_m.groups)
+                l_dur = l_m.duration
+                for t_idx in tut_ms:
+                    t_m = meetings[t_idx]
+                    if not (l_groups & set(t_m.groups)):
+                        continue
+                    same_day = model.new_bool_var(f"b2b_sd_{l_idx}_{t_idx}")
+                    model.add(day_vars[l_idx] == day_vars[t_idx]).only_enforce_if(same_day)
+                    model.add(day_vars[l_idx] != day_vars[t_idx]).only_enforce_if(same_day.Not())
+                    adj_start = model.new_bool_var(f"b2b_as_{l_idx}_{t_idx}")
+                    model.add(
+                        local_start_vars[t_idx] - local_start_vars[l_idx] == l_dur
+                    ).only_enforce_if(adj_start)
+                    model.add(
+                        local_start_vars[t_idx] - local_start_vars[l_idx] != l_dur
+                    ).only_enforce_if(adj_start.Not())
+                    adj = model.new_bool_var(f"b2b_adj_{l_idx}_{t_idx}")
+                    model.add(adj <= same_day)
+                    model.add(adj <= adj_start)
+                    adj_pair_bools.append(adj)
+
+                    same_room = model.new_bool_var(f"b2b_sr_{l_idx}_{t_idx}")
+                    model.add(room_vars[l_idx] == room_vars[t_idx]).only_enforce_if(same_room)
+                    model.add(room_vars[l_idx] != room_vars[t_idx]).only_enforce_if(same_room.Not())
+                    sr_full = model.new_bool_var(f"b2b_sr_full_{l_idx}_{t_idx}")
+                    model.add(sr_full <= adj)
+                    model.add(sr_full <= same_room)
+                    same_room_pair_bools.append(sr_full)
+
+            if not adj_pair_bools:
+                continue
+            b2b_sat = model.new_bool_var(f"b2b_sat_{r_idx}")
+            model.add(b2b_sat <= sum(adj_pair_bools))
+            b2b_satisfied_bools.append(b2b_sat)
+            sr_sat = model.new_bool_var(f"b2b_sr_sat_{r_idx}")
+            model.add(sr_sat <= sum(same_room_pair_bools))
+            b2b_same_room_bools.append(sr_sat)
+
     # --- Bad days: core-course group scheduled with > 5 meetings in a day ---
     # Per-group opportunity cap = max bad days achievable given its weekly
     # load. A group with N core events in the week can realize at most
@@ -789,6 +858,7 @@ def prepare_model(
                 for inst in insts:
                     inst_meeting_lits[inst][m_idx].append(opt_bools[opt_idx])
 
+    inst_teaches_m: dict[str, dict[int, cp_model.IntVar | int]] = {}
     inst_excess_vars: list[cp_model.IntVar] = []
     inst_excess_opportunities = 0
     for inst, per_meeting in inst_meeting_lits.items():
@@ -804,6 +874,7 @@ def prepare_model(
                 b = model.new_bool_var(f"inst_{inst}_teaches_{m_idx}")
                 model.add_max_equality(b, lits)
                 teaches_m[m_idx] = b
+        inst_teaches_m[inst] = teaches_m
         weekly_terms = [v for v in teaches_m.values()]
         # Linear channeling of "instructor active on day d" avoids O(meetings*days)
         # bool_and/bool_or reifications. `any_on_d` is a bool; LP minimization
@@ -827,6 +898,8 @@ def prepare_model(
 
     # --- Combine all scaled objective terms ---
     weight_same_day = 1
+    weight_back_to_back = 1
+    weight_b2b_same_room = 1
     weight_oversize_room = 1
     weight_bad_day = 1
     weight_bad_day_distinct = 1
@@ -836,19 +909,31 @@ def prepare_model(
     weight_group_excess = 1
     weight_inst_excess = 1
 
-    scaled_terms: list[tuple[int, int, list[cp_model.IntVar]]] = []
+    # Each entry is (weight, denom, penalty_expr) where `penalty_expr >= 0`
+    # and reaches 0 on a perfect schedule for that term. Objective is
+    # minimized, so the ideal total value is 0.
+    penalty_terms: list[tuple[int, int, cp_model.LinearExpr | int]] = []
     if satisfied_bools:
-        scaled_terms.append((weight_same_day, len(satisfied_bools), satisfied_bools))
+        miss_expr = len(satisfied_bools) - sum(satisfied_bools)
+        penalty_terms.append((weight_same_day, len(satisfied_bools), miss_expr))
+    if b2b_satisfied_bools:
+        b2b_miss = len(b2b_satisfied_bools) - sum(b2b_satisfied_bools)
+        penalty_terms.append((weight_back_to_back, len(b2b_satisfied_bools), b2b_miss))
+    if b2b_same_room_bools:
+        sr_miss = len(b2b_same_room_bools) - sum(b2b_same_room_bools)
+        penalty_terms.append((weight_b2b_same_room, len(b2b_same_room_bools), sr_miss))
     if oversize_bools and oversize_opportunities > 0:
-        scaled_terms.append((-weight_oversize_room, oversize_opportunities, oversize_bools))
+        penalty_terms.append((weight_oversize_room, oversize_opportunities, sum(oversize_bools)))
     if bad_day_bools and bad_day_opportunities > 0:
-        scaled_terms.append((-weight_bad_day, bad_day_opportunities, bad_day_bools))
+        penalty_terms.append((weight_bad_day, bad_day_opportunities, sum(bad_day_bools)))
     if bad_day_distinct_bools and bad_day_distinct_opportunities > 0:
-        scaled_terms.append(
-            (-weight_bad_day_distinct, bad_day_distinct_opportunities, bad_day_distinct_bools)
+        penalty_terms.append(
+            (weight_bad_day_distinct, bad_day_distinct_opportunities, sum(bad_day_distinct_bools))
         )
     if order_violation_bools:
-        scaled_terms.append((-weight_wrong_order, len(order_violation_bools), order_violation_bools))
+        penalty_terms.append(
+            (weight_wrong_order, len(order_violation_bools), sum(order_violation_bools))
+        )
     # Denominators reflect the upper bound on how many events could land
     # on the penalized slots: (#rooms) x (#days in category) x (#slots in
     # category). This is config-fixed and matches the semantics of the
@@ -857,33 +942,36 @@ def prepare_model(
     if weekend_event_bools:
         weekend_slot_capacity = len(weekend_day_indices) * slots_per_day * num_rooms
         if weekend_slot_capacity > 0:
-            scaled_terms.append((-weight_weekend, weekend_slot_capacity, weekend_event_bools))
+            penalty_terms.append((weight_weekend, weekend_slot_capacity, sum(weekend_event_bools)))
     if late_event_bools:
         late_slot_capacity = len(late_slot_indices) * num_days * num_rooms
         if late_slot_capacity > 0:
-            scaled_terms.append((-weight_late, late_slot_capacity, late_event_bools))
+            penalty_terms.append((weight_late, late_slot_capacity, sum(late_event_bools)))
     if group_excess_vars and group_excess_opportunities > 0:
-        scaled_terms.append((-weight_group_excess, group_excess_opportunities, group_excess_vars))
+        penalty_terms.append(
+            (weight_group_excess, group_excess_opportunities, sum(group_excess_vars))
+        )
     if inst_excess_vars and inst_excess_opportunities > 0:
-        scaled_terms.append((-weight_inst_excess, inst_excess_opportunities, inst_excess_vars))
+        penalty_terms.append(
+            (weight_inst_excess, inst_excess_opportunities, sum(inst_excess_vars))
+        )
 
-    if scaled_terms:
+    if penalty_terms:
         # Fixed-K rational scaling instead of LCM. Every term contributes
-        # at most |w| * K in magnitude (K = 10_000), which keeps
-        # coefficients bounded regardless of how many objectives we
-        # stack on. Rounding error per term is <= 1/K, well below any
-        # meaningful weight difference.
+        # at most w * K in magnitude (K = 10_000), which keeps coefficients
+        # bounded regardless of how many objectives we stack on. Rounding
+        # error per term is <= 1/K, well below any meaningful weight diff.
         K = 10_000
         obj_terms: list[cp_model.LinearExpr | int] = []
-        for w, denom, vars_ in scaled_terms:
+        for w, denom, expr in penalty_terms:
             if denom <= 0:
                 continue
             coef = int(round(w * K / denom))
             if coef == 0:
                 continue
-            obj_terms.append(coef * sum(vars_))
+            obj_terms.append(coef * expr)
         if obj_terms:
-            model.maximize(sum(obj_terms))
+            model.minimize(sum(obj_terms))
 
     return (
         PreparedModel(
@@ -895,6 +983,7 @@ def prepare_model(
             room_vars=room_vars,
             inst_choice_vars=inst_choice_vars,
             day_bool_by_meeting=day_bool_by_meeting,
+            feasible_room_indices_by_meeting=feasible_room_indices_by_meeting,
         ),
         None,
     )
@@ -979,7 +1068,13 @@ def apply_warm_start_hints(
                     prepared.model.add_hint(prepared.local_start_vars[m_idx], slot_to_idx[t_norm])
                     if not _is_constant(prepared.room_vars[m_idx]):
                         prepared.model.add_hint(prepared.room_vars[m_idx], room_to_idx[r_id])
-                    chosen = set(instructors_list[i]) if i < len(instructors_list) else set()
+                    chosen: set[str] = set()
+                    if i < len(instructors_list):
+                        raw_instructors = instructors_list[i]
+                        if isinstance(raw_instructors, list):
+                            chosen = {str(inst) for inst in raw_instructors}
+                        elif raw_instructors:
+                            chosen = {str(raw_instructors)}
                     m = meetings[m_idx]
                     if not _is_constant(prepared.inst_choice_vars[m_idx]):
                         for opt_idx, opts in enumerate(m.instructor_options):
@@ -1006,8 +1101,6 @@ def solve(
     solver.parameters.num_search_workers = workers
     solver.parameters.log_search_progress = True
     solver.parameters.log_to_stdout = show_progress
-    solver.parameters.linearization_level = 1
- 
     def _run_solver_once(active_log_path: Path | None = None):
         if active_log_path is not None:
             log_file = open(active_log_path, "a", encoding="utf-8")
@@ -1059,6 +1152,285 @@ def solve(
             solution_info=_compact_multiline(solver.SolutionInfo()),
         )
     return SolveExecution(solver=solver, status=status, phase_stats=phase_stats)
+
+
+def solve_phase2_rooms(
+    *,
+    prepared: PreparedModel,
+    phase1_solver: cp_model.CpSolver,
+    meetings: list[Meeting],
+    room_capacities: list[int],
+    slots_per_day: int,
+    time_limit: float,
+    show_progress: bool,
+    artifacts_dir: Path | None,
+    num_search_workers: int | None,
+) -> tuple[dict[int, int], SolveStats.PhaseStats]:
+    """Lexicographic phase 2: keep day/slot/instructor from phase 1, only
+    reassign rooms. Minimizes `weight_b2b_same_room + weight_oversize_room +
+    weight_inst_room_distinct` (distinct rooms per instructor, weekly).
+    """
+    phase_name = "phase2_rooms"
+
+    day_of = [int(phase1_solver.Value(v)) for v in prepared.day_vars]
+    start_of = [int(phase1_solver.Value(v)) for v in prepared.local_start_vars]
+    inst_opt_of = [int(phase1_solver.Value(v)) for v in prepared.inst_choice_vars]
+    feasible_rooms_by_m = prepared.feasible_room_indices_by_meeting
+
+    model = cp_model.CpModel()
+    room_vars: list[cp_model.IntVar] = []
+    room_pick_bools: list[dict[int, cp_model.IntVar | int]] = []
+    room_intervals: dict[int, list[cp_model.IntervalVar]] = defaultdict(list)
+    oversize_bools: list[cp_model.IntVar] = []
+    oversize_opportunities = 0
+
+    fallback_attendance_ratio = 0.9
+
+    def _is_oversize(room_idx: int, req: int) -> bool:
+        cap = room_capacities[room_idx]
+        return cap > req and (cap - req) * 100 > 30 * req
+
+    # Phase 1 room choices; needed to compute the per-meeting oversize baseline
+    # (so Phase 2 never regresses a non-oversize meeting into an oversize room).
+    phase1_rooms_per_meeting = [
+        int(phase1_solver.Value(prepared.room_vars[i])) for i in range(len(meetings))
+    ]
+
+    for i, meeting in enumerate(meetings):
+        dur = meeting.duration
+        abs_s = day_of[i] * slots_per_day + start_of[i]
+        abs_e = abs_s + dur
+        rooms_i = feasible_rooms_by_m[i]
+
+        if len(rooms_i) == 1:
+            only_idx = rooms_i[0]
+            room_vars.append(model.new_constant(only_idx))
+            room_pick_bools.append({only_idx: 1})
+            room_intervals[only_idx].append(
+                model.new_interval_var(abs_s, dur, abs_e, f"p2_room_iv_{i}")
+            )
+            continue
+
+        students = meeting.expected_students
+        if students <= 0:
+            required_for_metric = 1
+        else:
+            feasible_for_full = any(cap >= students for cap in room_capacities)
+            required_for_metric = max(
+                1,
+                students if feasible_for_full else math.ceil(students * fallback_attendance_ratio),
+            )
+
+        room_v = model.new_int_var_from_domain(
+            cp_model.Domain.FromValues(rooms_i), f"p2_room_{i}"
+        )
+        room_vars.append(room_v)
+        bools: dict[int, cp_model.IntVar | int] = {}
+        m_oversize: list[cp_model.IntVar] = []
+        has_non_oversize = False
+        for r_idx in rooms_i:
+            b = model.new_bool_var(f"p2_pick_{i}_{r_idx}")
+            bools[r_idx] = b
+            room_intervals[r_idx].append(
+                model.new_optional_interval_var(abs_s, dur, abs_e, b, f"p2_iv_{i}_{r_idx}")
+            )
+            if _is_oversize(r_idx, required_for_metric):
+                m_oversize.append(b)
+            else:
+                has_non_oversize = True
+        model.add_exactly_one(bools.values())
+        model.add(room_v == sum(r * b for r, b in bools.items()))
+        room_pick_bools.append(bools)
+        if m_oversize and has_non_oversize:
+            # Hard no-regression guard: if phase 1 placed this meeting in a
+            # non-oversize room, forbid every oversize room in phase 2.
+            if not _is_oversize(phase1_rooms_per_meeting[i], required_for_metric):
+                for b in m_oversize:
+                    model.add(b == 0)
+            oversize_bools.extend(m_oversize)
+            oversize_opportunities += 1
+
+    for ivals in room_intervals.values():
+        if len(ivals) > 1:
+            model.add_no_overlap(ivals)
+
+    # Reuse phase 1 room choices computed above for b2b classification.
+    phase1_rooms = phase1_rooms_per_meeting
+
+    class_tag: dict[tuple[int, int], str] = {}
+    for m in meetings:
+        class_tag[(m.course_idx, m.class_idx)] = str(m.tag).lower()
+    course_components: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for (c_idx_k, cls_idx_k), tag in class_tag.items():
+        course_components[c_idx_k][tag].append(cls_idx_k)
+    meetings_by_cls: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for m_idx, m in enumerate(meetings):
+        meetings_by_cls[(m.course_idx, m.class_idx)].append(m_idx)
+
+    # b2b lec->tut pairs adjacent in the phase 1 layout.
+    # Same-room pairs: hard-fix both rooms to their phase 1 values.
+    # Diff-room pairs: add soft "diff" penalty.
+    b2b_diff_bools: list[cp_model.IntVar] = []
+    b2b_problems = 0
+    for c_idx, comps in course_components.items():
+        lecs = comps.get("lec", [])
+        tuts = comps.get("tut", [])
+        for lec_cls in lecs:
+            for tut_cls in tuts:
+                lec_ms = meetings_by_cls.get((c_idx, lec_cls), [])
+                tut_ms = meetings_by_cls.get((c_idx, tut_cls), [])
+                if not lec_ms or not tut_ms:
+                    continue
+                for l_idx in lec_ms:
+                    lm = meetings[l_idx]
+                    l_groups = set(lm.groups)
+                    l_dur = lm.duration
+                    for t_idx in tut_ms:
+                        tm = meetings[t_idx]
+                        if not (l_groups & set(tm.groups)):
+                            continue
+                        if day_of[l_idx] != day_of[t_idx]:
+                            continue
+                        if start_of[t_idx] - start_of[l_idx] != l_dur:
+                            continue
+                        if phase1_rooms[l_idx] == phase1_rooms[t_idx]:
+                            r = phase1_rooms[l_idx]
+                            model.add(room_vars[l_idx] == r)
+                            model.add(room_vars[t_idx] == r)
+                        else:
+                            diff = model.new_bool_var(f"p2_b2b_diff_{l_idx}_{t_idx}")
+                            model.add(room_vars[l_idx] != room_vars[t_idx]).only_enforce_if(diff)
+                            model.add(room_vars[l_idx] == room_vars[t_idx]).only_enforce_if(diff.Not())
+                            b2b_diff_bools.append(diff)
+                            b2b_problems += 1
+
+    # Instructor consecutive-slot room swaps restricted to class/lab meetings.
+    # For every pair (a, b) with the same instructor in phase 1, on the same
+    # day, where slot(b) == slot(a) + duration(a), and both tags are in
+    # {class, lab}: penalize room mismatch.
+    class_lab_tags = {"class", "lab"}
+    inst_teaches: dict[str, list[int]] = defaultdict(list)
+    for m_idx, meeting in enumerate(meetings):
+        opt_idx = inst_opt_of[m_idx]
+        if not meeting.instructor_options:
+            continue
+        for inst in meeting.instructor_options[opt_idx]:
+            inst_teaches[inst].append(m_idx)
+
+    swap_bools: list[cp_model.IntVar] = []
+    swap_opportunities = 0
+    seen_pairs: set[tuple[int, int]] = set()
+    for inst, m_list in inst_teaches.items():
+        by_day: dict[int, list[int]] = defaultdict(list)
+        for m_idx in m_list:
+            by_day[day_of[m_idx]].append(m_idx)
+        for ms in by_day.values():
+            ms.sort(key=lambda x: start_of[x])
+            for k in range(len(ms) - 1):
+                a, b = ms[k], ms[k + 1]
+                if start_of[a] + meetings[a].duration != start_of[b]:
+                    continue
+                if str(meetings[a].tag).lower() not in class_lab_tags:
+                    continue
+                if str(meetings[b].tag).lower() not in class_lab_tags:
+                    continue
+                pair = (a, b)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                swap_opportunities += 1
+                diff = model.new_bool_var(f"p2_swap_{a}_{b}")
+                model.add(room_vars[a] != room_vars[b]).only_enforce_if(diff)
+                model.add(room_vars[a] == room_vars[b]).only_enforce_if(diff.Not())
+                swap_bools.append(diff)
+
+    weight_b2b_diff = 1
+    weight_oversize_room = 1
+    weight_swap = 1
+
+    penalty_terms: list[tuple[int, int, cp_model.LinearExpr | int]] = []
+    if b2b_diff_bools and b2b_problems > 0:
+        penalty_terms.append((weight_b2b_diff, b2b_problems, sum(b2b_diff_bools)))
+    if oversize_bools and oversize_opportunities > 0:
+        penalty_terms.append((weight_oversize_room, oversize_opportunities, sum(oversize_bools)))
+    if swap_bools and swap_opportunities > 0:
+        penalty_terms.append((weight_swap, swap_opportunities, sum(swap_bools)))
+
+    if penalty_terms:
+        K = 10_000
+        obj_terms: list[cp_model.LinearExpr | int] = []
+        for w, denom, expr in penalty_terms:
+            if denom <= 0:
+                continue
+            coef = int(round(w * K / denom))
+            if coef == 0:
+                continue
+            obj_terms.append(coef * expr)
+        if obj_terms:
+            model.minimize(sum(obj_terms))
+
+    # Warm start from phase 1 room assignments. Only hint the per-room pick
+    # bools (which are always freshly allocated); skipping `room_vars[m]`
+    # avoids duplicate hints on interned constants returned by
+    # `new_constant()` for single-feasible-room meetings.
+    for m_idx in range(len(meetings)):
+        phase1_room = int(phase1_solver.Value(prepared.room_vars[m_idx]))
+        for r_idx, b in room_pick_bools[m_idx].items():
+            if isinstance(b, cp_model.IntVar):
+                model.add_hint(b, 1 if r_idx == phase1_room else 0)
+
+    solver = cp_model.CpSolver()
+    available_cores = max(1, os.cpu_count() or 1)
+    default_workers = min(16, available_cores)
+    workers = default_workers if num_search_workers is None else max(1, int(num_search_workers))
+    solver.parameters.num_search_workers = workers
+    solver.parameters.log_search_progress = True
+    solver.parameters.log_to_stdout = show_progress
+    solver.parameters.max_time_in_seconds = max(0.1, float(time_limit))
+
+    if artifacts_dir is not None:
+        phase_log_path = artifacts_dir / "solver_log_phase_2.txt"
+        phase_log_path.write_text("", encoding="utf-8")
+        log_file = open(phase_log_path, "a", encoding="utf-8")
+
+        def _cb(msg: str) -> None:
+            log_file.write(msg)
+            log_file.write("\n")
+
+        solver.log_callback = _cb
+        try:
+            status = solver.Solve(model)
+        finally:
+            log_file.close()
+            solver.log_callback = None
+    else:
+        status = solver.Solve(model)
+
+    objective_value = float(solver.ObjectiveValue()) if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None
+    best_objective_bound = (
+        float(solver.BestObjectiveBound())
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE, cp_model.UNKNOWN)
+        else None
+    )
+    phase_stats = SolveStats.PhaseStats(
+        phase=phase_name,
+        decision="ran",
+        solver_status=solver.StatusName(status),
+        objective_value=objective_value,
+        best_objective_bound=best_objective_bound,
+        max_time_in_seconds=float(solver.parameters.max_time_in_seconds),
+        solver_parameters=_compact_multiline(str(solver.parameters)),
+        variable_count=len(model.proto.variables),
+        constraint_count=len(model.proto.constraints),
+        response_stats=_compact_multiline(solver.ResponseStats()),
+        solution_info=_compact_multiline(solver.SolutionInfo()),
+    )
+
+    overrides: dict[int, int] = {}
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for m_idx, rv in enumerate(room_vars):
+            overrides[m_idx] = int(solver.Value(rv))
+    return overrides, phase_stats
 
 
 def solve_schedule(
@@ -1135,15 +1507,9 @@ def solve_schedule(
             count = cls.per_week
 
             instructor_options: list[list[str]] = []
-            seen_options: set[tuple[str, ...]] = set()
             if cls.instructor_pool:
                 for p in cls.instructor_pool:
-                    opt = p if isinstance(p, list) else [p]
-                    key = tuple(sorted(opt))
-                    if key in seen_options:
-                        continue
-                    seen_options.add(key)
-                    instructor_options.append(opt)
+                    instructor_options.append(p if isinstance(p, list) else [p])
             if not instructor_options:
                 instructor_options = [[]]
 
@@ -1229,6 +1595,23 @@ def solve_schedule(
     )
     schedule_empty = Schedule()
 
+    phase2_room_overrides: dict[int, int] = {}
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        phase2_time_limit = max(60, int(time_limit) // 4)
+        phase2_overrides, phase2_stats = solve_phase2_rooms(
+            prepared=prepared,
+            phase1_solver=solver,
+            meetings=meetings,
+            room_capacities=room_capacities,
+            slots_per_day=slots_per_day,
+            time_limit=phase2_time_limit,
+            show_progress=show_progress,
+            artifacts_dir=artifacts_dir,
+            num_search_workers=num_search_workers,
+        )
+        stats.phase_stats.append(phase2_stats)
+        phase2_room_overrides = phase2_overrides
+
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         if status == cp_model.INFEASIBLE:
             assumptions = solver.sufficient_assumptions_for_infeasibility()
@@ -1270,13 +1653,20 @@ def solve_schedule(
 
                 di = solver.Value(prepared.day_vars[m_idx])
                 t_idx = solver.Value(prepared.local_start_vars[m_idx])
-                r_val = solver.Value(prepared.room_vars[m_idx])
+                r_val = phase2_room_overrides.get(
+                    m_idx, int(solver.Value(prepared.room_vars[m_idx]))
+                )
                 inst_opt_idx = solver.Value(prepared.inst_choice_vars[m_idx])
 
                 day_name = days[di]
                 slot_time = cfg.term.time_slots[t_idx]
                 room_id = room_ids[r_val]
                 chosen_insts = m.instructor_options[inst_opt_idx] if m.instructor_options else []
+                chosen_inst_entry: str | list[str]
+                if len(chosen_insts) <= 1:
+                    chosen_inst_entry = chosen_insts[0] if chosen_insts else ""
+                else:
+                    chosen_inst_entry = list(chosen_insts)
 
                 g_key = tuple(m.groups)
                 if not instances_map[g_key].audience:
@@ -1286,7 +1676,7 @@ def solve_schedule(
                 instances_map[g_key].day_indices.append(di)
                 instances_map[g_key].start_times.append(slot_time)
                 instances_map[g_key].rooms.append(room_id)
-                instances_map[g_key].instructors.append(chosen_insts)
+                instances_map[g_key].instructors.append(chosen_inst_entry)
 
             class_output = CourseSchedule.ComponentOutput(
                 tag=cls_cfg.tag,
