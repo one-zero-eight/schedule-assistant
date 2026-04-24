@@ -156,16 +156,21 @@ class FlatMeeting:
 class ScheduleMetrics:
     run_status: str
     run_elapsed_seconds: float | None
+    run_objective_value: float | None
     hard_conflicts: tuple[str, ...]
     hard_unsatisfied_constraints: tuple[str, ...]
     ctx_total_events: int
     ctx_total_timeslots_count: int
     ctx_total_weighted_group_hours: float
     ctx_total_core_course_groups_count: int
-    quality_back_to_back_lec_tut_opportunities: int
+    ctx_total_english_groups_count: int
+    ctx_total_electives_groups_count: int
+    quality_back_to_back_lec_tut_total: int
+    quality_back_to_back_lec_tut_possible: int
     quality_back_to_back_lec_tut_scheduled: int
     quality_back_to_back_lec_tut_ratio: float
-    quality_same_day_lec_tut_lab_opportunities: int
+    quality_same_day_lec_tut_lab_total: int
+    quality_same_day_lec_tut_lab_possible: int
     quality_same_day_lec_tut_lab_satisfied: int
     quality_same_day_lec_tut_lab_ratio: float
     quality_labs_before_tutorial_count: int
@@ -173,18 +178,20 @@ class ScheduleMetrics:
     quality_tutorials_before_lecture_count: int
     rooms_events_exceeding_capacity_count: int
     rooms_events_much_larger_than_students_count: int
-    rooms_events_much_larger_than_students_opportunities: int
+    rooms_events_much_larger_than_students_possible: int
+    rooms_events_much_larger_than_students_total: int
     rooms_events_much_larger_than_students_ratio: float
     rooms_overflow_students_total: int
     rooms_wasted_seat_hours: float
-    room_continuity_lec_tut_same_room_opportunities: int
+    room_continuity_lec_tut_same_room_total: int
+    room_continuity_lec_tut_same_room_possible: int
     room_continuity_lec_tut_same_room_count: int
     room_continuity_lec_tut_same_room_ratio: float
-    room_continuity_instructor_room_swaps_consecutive_opportunities: int
+    room_continuity_instructor_room_swaps_consecutive_possible: int
+    room_continuity_instructor_room_swaps_consecutive_total: int
     room_continuity_instructor_room_swaps_consecutive: int
     room_continuity_instructor_room_swaps_consecutive_ratio: float
     hatred_global_saturday_event_count: int
-    hatred_global_sunday_event_count: int
     hatred_global_late_events_count: int
     hatred_global_late_events_lec_count: int
     hatred_global_late_events_tut_count: int
@@ -195,6 +202,8 @@ class ScheduleMetrics:
     hatred_student_groups_with_bad_days_distinct: int
     hatred_student_total_active_days_excess_groups: int
     hatred_student_groups_with_excess_day_count: int
+    hatred_instructor_bad_days_events_total: int
+    hatred_instructor_with_bad_days_events_count: int
     hatred_instructor_total_active_days_excess: int
     hatred_instructor_with_excess_day_count: int
 
@@ -218,26 +227,32 @@ def _is_consecutive(a: FlatMeeting, b: FlatMeeting, time_slots: list[datetime.ti
     return ia is not None and ib is not None and ib == ia + 1
 
 
-def _lec_tut_same_room_stats(events: list[FlatMeeting], cfg: ScheduleConfig) -> tuple[int, int]:
-    opportunities = _back_to_back_lecture_tutorial_opportunities(cfg)
-    tuts_by_start_room: dict[tuple[int, tuple[str, ...], str, datetime.time, str], set[int]] = defaultdict(set)
+def _lec_tut_same_room_stats(events: list[FlatMeeting], cfg: ScheduleConfig) -> int:
+    time_slots = cfg.term.time_slots
+    tuts_by_slot_room: dict[tuple[int, str, int, str], list[FlatMeeting]] = defaultdict(list)
     same_room_pairs: set[tuple[int, int, int]] = set()
     for e in events:
         if str(e.component_tag).lower() == "tut":
-            key = (e.course_idx, e.groups, e.day, e.start_time, e.room)
-            tuts_by_start_room[key].add(e.component_idx)
+            s = _slot_index(e.start_time, time_slots)
+            if s is not None:
+                tuts_by_slot_room[(e.course_idx, e.day, s, e.room)].append(e)
     for e in events:
         if str(e.component_tag).lower() != "lec":
             continue
-        key = (e.course_idx, e.groups, e.day, _slot_end(e.start_time), e.room)
-        for tut_component_idx in tuts_by_start_room.get(key, set()):
-            same_room_pairs.add((e.course_idx, e.component_idx, tut_component_idx))
-    return opportunities, len(same_room_pairs)
+        lec_slot = _slot_index(e.start_time, time_slots)
+        if lec_slot is None:
+            continue
+        lec_groups = set(e.groups)
+        for tut in tuts_by_slot_room.get((e.course_idx, e.day, lec_slot + 1, e.room), ()):
+            if lec_groups & set(tut.groups):
+                same_room_pairs.add((e.course_idx, e.component_idx, tut.component_idx))
+    return len(same_room_pairs)
 
 
 def _instructor_room_swaps_consecutive(
     events: list[FlatMeeting], time_slots: list[datetime.time]
 ) -> tuple[int, int]:
+    class_lab_tags = {"class", "lab"}
     by_instructor_day: dict[tuple[str, str], list[FlatMeeting]] = defaultdict(list)
     for e in events:
         for instructor in e.instructors:
@@ -247,10 +262,15 @@ def _instructor_room_swaps_consecutive(
     for evs in by_instructor_day.values():
         evs.sort(key=lambda x: x.start_time)
         for a, b in zip(evs, evs[1:]):
-            if _is_consecutive(a, b, time_slots):
-                opportunities += 1
-                if a.room != b.room:
-                    total += 1
+            if not _is_consecutive(a, b, time_slots):
+                continue
+            if str(a.component_tag).lower() not in class_lab_tags:
+                continue
+            if str(b.component_tag).lower() not in class_lab_tags:
+                continue
+            opportunities += 1
+            if a.room != b.room:
+                total += 1
     return opportunities, total
 
 
@@ -264,6 +284,13 @@ def _iter_flat_meetings(schedule: Schedule, cfg: ScheduleConfig) -> Iterator[Fla
                     raise AssertionError(f"parallel lists length mismatch for {course.name}/{comp.tag}")
                 for i in range(n):
                     day = series.days[i]
+                    raw_inst = series.instructors[i]
+                    if isinstance(raw_inst, list):
+                        insts = tuple(raw_inst)
+                    elif raw_inst:
+                        insts = (raw_inst,)
+                    else:
+                        insts = ()
                     yield FlatMeeting(
                         course_idx=c_idx,
                         component_idx=comp_idx,
@@ -274,7 +301,7 @@ def _iter_flat_meetings(schedule: Schedule, cfg: ScheduleConfig) -> Iterator[Fla
                         day_index=rank.get(day, WEEKDAY_RANK.get(day, 999)),
                         start_time=series.start_times[i],
                         room=series.rooms[i],
-                        instructors=tuple(series.instructors[i]),
+                        instructors=insts,
                     )
 
 
@@ -314,35 +341,64 @@ def _meeting_expected_students(comp_cfg: CourseConfig.Component, groups: tuple[s
     return max(0, sum(sizes.get(g, 0) for g in groups))
 
 
-def _back_to_back_lecture_tutorial_opportunities(cfg: ScheduleConfig) -> int:
+def _back_to_back_lec_tut_counts(cfg: ScheduleConfig) -> tuple[int, int]:
+    """Return (possible, total) (lec, tut) component pairs per course.
+
+    - total: raw sum_c (lec_count x tut_count), regardless of group overlap.
+    - possible: pairs whose lec/tut components share at least one student
+      group (i.e. pairs the solver can actually make back-to-back).
+    """
+    selector_map = resolve_selector_map(cfg)
+    possible = 0
     total = 0
     for course in cfg.courses:
-        lecs = sum(1 for c in course.components if str(c.tag).lower() == "lec")
-        tuts = sum(1 for c in course.components if str(c.tag).lower() == "tut")
-        total += lecs * tuts
-    return total
+        lec_groups_list: list[set[str]] = []
+        tut_groups_list: list[set[str]] = []
+        for c in course.components:
+            tag = str(c.tag).lower()
+            groups = set(expand_groups(c.student_groups, selector_map))
+            if tag == "lec":
+                lec_groups_list.append(groups)
+            elif tag == "tut":
+                tut_groups_list.append(groups)
+        total += len(lec_groups_list) * len(tut_groups_list)
+        for lg in lec_groups_list:
+            for tg in tut_groups_list:
+                if lg & tg:
+                    possible += 1
+    return possible, total
 
 
-def _back_to_back_lecture_tutorial_scheduled(events: list[FlatMeeting]) -> int:
-    tuts_by_start: dict[tuple[int, tuple[str, ...], str, datetime.time], set[int]] = defaultdict(set)
-    satisfied_pairs: set[tuple[int, int, int]] = set()
+def _back_to_back_lecture_tutorial_scheduled(events: list[FlatMeeting], cfg: ScheduleConfig) -> int:
+    # A (course, lec_component, tut_component) pair is "back-to-back" if at
+    # least one lec instance and one tut instance share a student group, fall
+    # on the same day, and the tut occupies the slot immediately after the
+    # lec. "Immediately after" is slot-index based (tut.slot == lec.slot + 1)
+    # so fixed breaks between slots don't invalidate adjacency.
+    time_slots = cfg.term.time_slots
+    tuts_by_day_slot: dict[tuple[int, str, int], list[FlatMeeting]] = defaultdict(list)
     for e in events:
-        tag = str(e.component_tag).lower()
-        if tag == "tut":
-            key = (e.course_idx, e.groups, e.day, e.start_time)
-            tuts_by_start[key].add(e.component_idx)
+        if str(e.component_tag).lower() == "tut":
+            s = _slot_index(e.start_time, time_slots)
+            if s is not None:
+                tuts_by_day_slot[(e.course_idx, e.day, s)].append(e)
+    satisfied_pairs: set[tuple[int, int, int]] = set()
     for e in events:
         if str(e.component_tag).lower() != "lec":
             continue
-        tut_key = (e.course_idx, e.groups, e.day, _slot_end(e.start_time))
-        for tut_component_idx in tuts_by_start.get(tut_key, set()):
-            satisfied_pairs.add((e.course_idx, e.component_idx, tut_component_idx))
+        lec_slot = _slot_index(e.start_time, time_slots)
+        if lec_slot is None:
+            continue
+        lec_groups = set(e.groups)
+        for tut in tuts_by_day_slot.get((e.course_idx, e.day, lec_slot + 1), ()):
+            if lec_groups & set(tut.groups):
+                satisfied_pairs.add((e.course_idx, e.component_idx, tut.component_idx))
     return len(satisfied_pairs)
 
 
-def _lec_tut_lab_rows(cfg: ScheduleConfig) -> list[tuple[int, int, int, int, str]]:
+def _lec_tut_lab_rows(cfg: ScheduleConfig) -> list[tuple[int, int, int, int | None, str]]:
     selector_map = resolve_selector_map(cfg)
-    rows: list[tuple[int, int, int, int, str]] = []
+    rows: list[tuple[int, int, int, int | None, str]] = []
     for c_idx, course in enumerate(cfg.courses):
         lecs = [(i, c) for i, c in enumerate(course.components) if str(c.tag).lower() == "lec"]
         tuts = [(i, c) for i, c in enumerate(course.components) if str(c.tag).lower() == "tut"]
@@ -353,18 +409,45 @@ def _lec_tut_lab_rows(cfg: ScheduleConfig) -> list[tuple[int, int, int, int, str
         lec_groups = set(expand_groups(lec.student_groups, selector_map))
         for tut_i, tut in tuts:
             tut_groups = set(expand_groups(tut.student_groups, selector_map))
-            for lab_i, lab in labs:
-                lab_groups = set(expand_groups(lab.student_groups, selector_map))
-                for g in sorted(lec_groups & tut_groups & lab_groups):
-                    rows.append((c_idx, lec_i, tut_i, lab_i, g))
+            if labs:
+                for lab_i, lab in labs:
+                    lab_groups = set(expand_groups(lab.student_groups, selector_map))
+                    for g in sorted(lec_groups & tut_groups & lab_groups):
+                        rows.append((c_idx, lec_i, tut_i, lab_i, g))
+            else:
+                for g in sorted(lec_groups & tut_groups):
+                    rows.append((c_idx, lec_i, tut_i, None, g))
     return rows
 
 
-def _same_day_lec_tut_lab_opportunities(cfg: ScheduleConfig) -> int:
+def _same_day_lec_tut_lab_possible(cfg: ScheduleConfig) -> int:
+    """Per-group (course, lec, tut, lab, group) rows where all three share the group.
+
+    Matches the solver's triple_rows denominator, so covered/possible is aligned
+    with what the solver optimizes.
+    """
+    return len(_lec_tut_lab_rows(cfg))
+
+
+def _same_day_lec_tut_lab_total(cfg: ScheduleConfig) -> int:
+    """Raw per-group rows for lec+tut(+lab) without shared-group filter."""
+    selector_map = resolve_selector_map(cfg)
     total = 0
-    for c_idx, lec_i, tut_i, lab_i, _g in _lec_tut_lab_rows(cfg):
-        comps = cfg.courses[c_idx].components
-        total += min(comps[lec_i].per_week, comps[tut_i].per_week, comps[lab_i].per_week)
+    for course in cfg.courses:
+        lecs = [c for c in course.components if str(c.tag).lower() == "lec"]
+        tuts = [c for c in course.components if str(c.tag).lower() == "tut"]
+        labs = [c for c in course.components if str(c.tag).lower() == "lab"]
+        if not tuts or len(lecs) != 1:
+            continue
+        lec_groups = set(expand_groups(lecs[0].student_groups, selector_map))
+        for tut in tuts:
+            tut_groups = set(expand_groups(tut.student_groups, selector_map))
+            if labs:
+                for lab in labs:
+                    lab_groups = set(expand_groups(lab.student_groups, selector_map))
+                    total += len(lec_groups | tut_groups | lab_groups)
+            else:
+                total += len(lec_groups | tut_groups)
     return total
 
 
@@ -376,13 +459,15 @@ def _same_day_lec_tut_lab_satisfied(events: list[FlatMeeting], cfg: ScheduleConf
             continue
         for g in e.groups:
             by_key[(e.course_idx, g, e.day)][e.component_idx] = tag
-    triples: dict[tuple[int, str], list[tuple[int, int, int]]] = defaultdict(list)
+    triples: dict[tuple[int, str], list[tuple[int, int, int | None]]] = defaultdict(list)
     for c, li, ti, bi, g in _lec_tut_lab_rows(cfg):
         triples[(c, g)].append((li, ti, bi))
-    satisfied: set[tuple[int, int, int, int, str]] = set()
+    satisfied: set[tuple[int, int, int, int | None, str]] = set()
     for (c, g, _d), comp_map in by_key.items():
         for li, ti, bi in triples.get((c, g), []):
-            if comp_map.get(li) == "lec" and comp_map.get(ti) == "tut" and comp_map.get(bi) == "lab":
+            if comp_map.get(li) != "lec" or comp_map.get(ti) != "tut":
+                continue
+            if bi is None or comp_map.get(bi) == "lab":
                 satisfied.add((c, li, ti, bi, g))
     return len(satisfied)
 
@@ -510,6 +595,11 @@ def list_unsatisfied(result: SolveResult, cfg: ScheduleConfig) -> list[str]:
 
 
 def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> ScheduleMetrics:
+    objective_value: float | None = None
+    for phase in result.stats.phase_stats:
+        if phase.objective_value is not None:
+            objective_value = float(phase.objective_value)
+
     events = list(_iter_flat_meetings(result.schedule, cfg)) if result.status in ("OPTIMAL", "FEASIBLE") else []
     group_sizes = _group_size_map(cfg)
     room_caps = {room.id: room.capacity for room in cfg.rooms}
@@ -519,7 +609,6 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
     per_group_day_subjects: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     per_inst_day_load: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     saturday_event_count = 0
-    sunday_event_count = 0
     total_weighted_group_hours = 0.0
     events_exceeding_room_capacity_count = 0
     events_with_room_much_larger_than_students_count = 0
@@ -532,8 +621,6 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         total_weighted_group_hours += event_hours * len(e.groups)
         if e.day == "Sat":
             saturday_event_count += 1
-        if e.day == "Sun":
-            sunday_event_count += 1
         for g in e.groups:
             per_group_day_load[g][e.day] += 1
             if WEEKDAY_RANK.get(e.day, 999) in WEEKDAYS_MON_SAT:
@@ -561,7 +648,6 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         if room_capacity > required_capacity:
             oversize_pct = ((room_capacity - required_capacity) * 100) // max(1, required_capacity)
             if oversize_pct > ROOM_OVERSIZE_PCT_THRESHOLD:
-                events_with_room_much_larger_than_students_count += 1
                 is_oversize_here = True
         had_non_oversize_option = any(
             cap >= required_capacity
@@ -570,10 +656,8 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         )
         if had_non_oversize_option:
             events_with_oversize_avoidance_opportunity_count += 1
-        elif is_oversize_here:
-            # Meeting was forced into oversize — no better option existed, so
-            # it's not an "avoidance opportunity"; excluded from denominator.
-            pass
+            if is_oversize_here:
+                events_with_room_much_larger_than_students_count += 1
 
     core_course_idx = {i for i, c in enumerate(cfg.courses) if "core_course" in {str(t).lower() for t in c.course_tags}}
     core_events_per_group_day: dict[tuple[str, str], int] = defaultdict(int)
@@ -619,12 +703,18 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         if excess > 0:
             group_excess_count += 1
 
+    inst_bad_days_total = 0
+    inst_bad_days_count = 0
     inst_excess_total = 0
     inst_excess_count = 0
     for day_load in per_inst_day_load.values():
         weekly_events = sum(day_load.values())
         if weekly_events <= 0:
             continue
+        ibad = sum(1 for n in day_load.values() if n > INSTRUCTOR_DAILY_EVENT_THRESHOLD)
+        inst_bad_days_total += ibad
+        if ibad > 0:
+            inst_bad_days_count += 1
         active_days = sum(1 for n in day_load.values() if n > 0)
         min_active = max(1, math.ceil(weekly_events / INSTRUCTOR_DAILY_EVENT_THRESHOLD))
         excess = max(0, active_days - min_active)
@@ -633,37 +723,46 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
             inst_excess_count += 1
 
     late_events = [e for e in events if _slot_end(e.start_time) > datetime.time(18, 0)]
-    lec_tut_same_room_opportunities, lec_tut_same_room_count = _lec_tut_same_room_stats(events, cfg)
+    lec_tut_same_room_count = _lec_tut_same_room_stats(events, cfg)
     (
         instructor_room_swaps_consecutive_opportunities,
         instructor_room_swaps_consecutive,
     ) = _instructor_room_swaps_consecutive(events, cfg.term.time_slots)
-    back_to_back_lec_tut_opportunities = _back_to_back_lecture_tutorial_opportunities(cfg)
-    back_to_back_lec_tut_scheduled = _back_to_back_lecture_tutorial_scheduled(events)
-    same_day_lec_tut_lab_opportunities = _same_day_lec_tut_lab_opportunities(cfg)
+    b2b_possible, b2b_total = _back_to_back_lec_tut_counts(cfg)
+    back_to_back_lec_tut_scheduled = _back_to_back_lecture_tutorial_scheduled(events, cfg)
+    same_day_lec_tut_lab_possible = _same_day_lec_tut_lab_possible(cfg)
+    same_day_lec_tut_lab_total = _same_day_lec_tut_lab_total(cfg)
     same_day_lec_tut_lab_satisfied = _same_day_lec_tut_lab_satisfied(events, cfg)
+
+    english_groups_count = sum(1 for g in cfg.students_groups if str(g.kind).strip().lower() == "english")
+    electives_groups_count = sum(
+        1 for g in cfg.students_groups if str(g.kind).strip().lower() in {"elective", "electives"}
+    )
 
     return ScheduleMetrics(
         run_status=result.status,
         run_elapsed_seconds=result.stats.elapsed_seconds,
+        run_objective_value=objective_value,
         hard_conflicts=tuple(list_conflicts(result, cfg)),
         hard_unsatisfied_constraints=tuple(list_unsatisfied(result, cfg)),
         ctx_total_events=len(events),
         ctx_total_timeslots_count=total_slots,
         ctx_total_weighted_group_hours=total_weighted_group_hours,
         ctx_total_core_course_groups_count=len(core_group_ids),
-        quality_back_to_back_lec_tut_opportunities=back_to_back_lec_tut_opportunities,
+        ctx_total_english_groups_count=english_groups_count,
+        ctx_total_electives_groups_count=electives_groups_count,
+        quality_back_to_back_lec_tut_total=b2b_total,
+        quality_back_to_back_lec_tut_possible=b2b_possible,
         quality_back_to_back_lec_tut_scheduled=back_to_back_lec_tut_scheduled,
         quality_back_to_back_lec_tut_ratio=(
-            back_to_back_lec_tut_scheduled / back_to_back_lec_tut_opportunities
-            if back_to_back_lec_tut_opportunities > 0
-            else 0.0
+            back_to_back_lec_tut_scheduled / b2b_possible if b2b_possible > 0 else 0.0
         ),
-        quality_same_day_lec_tut_lab_opportunities=same_day_lec_tut_lab_opportunities,
+        quality_same_day_lec_tut_lab_total=same_day_lec_tut_lab_total,
+        quality_same_day_lec_tut_lab_possible=same_day_lec_tut_lab_possible,
         quality_same_day_lec_tut_lab_satisfied=same_day_lec_tut_lab_satisfied,
         quality_same_day_lec_tut_lab_ratio=(
-            same_day_lec_tut_lab_satisfied / same_day_lec_tut_lab_opportunities
-            if same_day_lec_tut_lab_opportunities > 0
+            same_day_lec_tut_lab_satisfied / same_day_lec_tut_lab_possible
+            if same_day_lec_tut_lab_possible > 0
             else 0.0
         ),
         quality_labs_before_tutorial_count=_count_tag_before_tag(events, cfg, "lab", "tut"),
@@ -671,7 +770,8 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         quality_tutorials_before_lecture_count=_count_tag_before_tag(events, cfg, "tut", "lec"),
         rooms_events_exceeding_capacity_count=events_exceeding_room_capacity_count,
         rooms_events_much_larger_than_students_count=events_with_room_much_larger_than_students_count,
-        rooms_events_much_larger_than_students_opportunities=events_with_oversize_avoidance_opportunity_count,
+        rooms_events_much_larger_than_students_possible=events_with_oversize_avoidance_opportunity_count,
+        rooms_events_much_larger_than_students_total=len(events),
         rooms_events_much_larger_than_students_ratio=(
             events_with_room_much_larger_than_students_count / events_with_oversize_avoidance_opportunity_count
             if events_with_oversize_avoidance_opportunity_count > 0
@@ -679,12 +779,14 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         ),
         rooms_overflow_students_total=total_capacity_overflow_students,
         rooms_wasted_seat_hours=wasted_seat_hours,
-        room_continuity_lec_tut_same_room_opportunities=lec_tut_same_room_opportunities,
+        room_continuity_lec_tut_same_room_total=b2b_total,
+        room_continuity_lec_tut_same_room_possible=b2b_possible,
         room_continuity_lec_tut_same_room_count=lec_tut_same_room_count,
         room_continuity_lec_tut_same_room_ratio=(
-            lec_tut_same_room_count / lec_tut_same_room_opportunities if lec_tut_same_room_opportunities > 0 else 0.0
+            lec_tut_same_room_count / b2b_possible if b2b_possible > 0 else 0.0
         ),
-        room_continuity_instructor_room_swaps_consecutive_opportunities=instructor_room_swaps_consecutive_opportunities,
+        room_continuity_instructor_room_swaps_consecutive_possible=instructor_room_swaps_consecutive_opportunities,
+        room_continuity_instructor_room_swaps_consecutive_total=instructor_room_swaps_consecutive_opportunities,
         room_continuity_instructor_room_swaps_consecutive=instructor_room_swaps_consecutive,
         room_continuity_instructor_room_swaps_consecutive_ratio=(
             instructor_room_swaps_consecutive / instructor_room_swaps_consecutive_opportunities
@@ -692,7 +794,6 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
             else 0.0
         ),
         hatred_global_saturday_event_count=saturday_event_count,
-        hatred_global_sunday_event_count=sunday_event_count,
         hatred_global_late_events_count=len(late_events),
         hatred_global_late_events_lec_count=sum(1 for e in late_events if str(e.component_tag).lower() == "lec"),
         hatred_global_late_events_tut_count=sum(1 for e in late_events if str(e.component_tag).lower() == "tut"),
@@ -705,6 +806,8 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         hatred_student_groups_with_bad_days_distinct=groups_with_bad_distinct,
         hatred_student_total_active_days_excess_groups=group_excess_total,
         hatred_student_groups_with_excess_day_count=group_excess_count,
+        hatred_instructor_bad_days_events_total=inst_bad_days_total,
+        hatred_instructor_with_bad_days_events_count=inst_bad_days_count,
         hatred_instructor_total_active_days_excess=inst_excess_total,
         hatred_instructor_with_excess_day_count=inst_excess_count,
     )
@@ -765,67 +868,109 @@ def _resolve_solution_path(solution_path: Path | None) -> Path:
     return _latest_results_output_path(project_root / "results")
 
 
+def _fmt_coverage(
+    label: str,
+    covered: int,
+    possible: int,
+    total: int,
+    unit: str,
+    higher_better: bool = True,
+) -> str:
+    pct = (covered / possible * 100.0) if possible > 0 else 0.0
+    if higher_better:
+        return (
+            f"- {label} (higher is better):\n"
+            f"    covered {covered} from {possible}, {pct:.1f}% coverage\n"
+            f"    with {total} total {unit} in the config"
+        )
+    return (
+        f"- {label} (lower is better):\n"
+        f"    {covered} from {possible} possible, {pct:.1f}% incidence\n"
+        f"    with {total} total {unit} in the config"
+    )
+
+
 def _print_human_report(metrics: ScheduleMetrics) -> None:
     print("=== Schedule Metrics ===")
     print("Context / dataset:")
     print(f"- solution status: {metrics.run_status}")
     print(f"- elapsed seconds: {metrics.run_elapsed_seconds}")
+    print(f"- solution objective value: {metrics.run_objective_value}")
     print(f"- total scheduled events: {metrics.ctx_total_events}")
     print(f"- total available timeslots (teaching days x day slots): {metrics.ctx_total_timeslots_count}")
     print(f"- total meeting hours weighted by group count: {metrics.ctx_total_weighted_group_hours:.1f}")
-    print(f"- total core-course groups count: {metrics.ctx_total_core_course_groups_count}")
+    print(f"- total Core Courses groups count: {metrics.ctx_total_core_course_groups_count}")
+    print(f"- total English groups count: {metrics.ctx_total_english_groups_count}")
+    print(f"- total Electives groups count: {metrics.ctx_total_electives_groups_count}")
     print("---")
     print("Metrics:")
     print(f"- hard conflicts (should be 0): {len(metrics.hard_conflicts)}")
     print(f"- unsatisfied constraints (should be 0): {len(metrics.hard_unsatisfied_constraints)}")
     print(
-        f"- back-to-back lec->tut coverage (higher is better): "
-        f"{metrics.quality_back_to_back_lec_tut_scheduled}/{metrics.quality_back_to_back_lec_tut_opportunities}={metrics.quality_back_to_back_lec_tut_ratio:.3f}"
+        _fmt_coverage(
+            "lec+tut(+lab) same-day coverage",
+            metrics.quality_same_day_lec_tut_lab_satisfied,
+            metrics.quality_same_day_lec_tut_lab_possible,
+            metrics.quality_same_day_lec_tut_lab_total,
+            "(lec, tut[, lab]) tuples",
+            higher_better=True,
+        )
     )
     print(
-        f"- lec+tut+lab on same-day coverage (higher is better): "
-        f"{metrics.quality_same_day_lec_tut_lab_satisfied}/{metrics.quality_same_day_lec_tut_lab_opportunities}={metrics.quality_same_day_lec_tut_lab_ratio:.3f}"
+        _fmt_coverage(
+            "back-to-back lec->tut coverage",
+            metrics.quality_back_to_back_lec_tut_scheduled,
+            metrics.quality_back_to_back_lec_tut_possible,
+            metrics.quality_back_to_back_lec_tut_total,
+            "(lec, tut) pairs",
+            higher_better=True,
+        )
     )
+    print(
+        f"    same-room within back-to-back: "
+        f"covered {metrics.room_continuity_lec_tut_same_room_count} from "
+        f"{metrics.room_continuity_lec_tut_same_room_possible}, "
+        f"{(metrics.room_continuity_lec_tut_same_room_ratio * 100.0):.1f}% coverage"
+    )
+    
     print(
         "- wrong component order counts (lower is better):\n"
         f"  - labs-before-tutorial={metrics.quality_labs_before_tutorial_count}\n"
         f"  - labs-before-lecture={metrics.quality_labs_before_lecture_count}\n"
         f"  - tutorials-before-lecture={metrics.quality_tutorials_before_lecture_count}"
     )
+    print(f"- undersized-room events (should be 0): {metrics.rooms_events_exceeding_capacity_count}")
     print(
-        "- room capacity violations (lower is better):\n"
-        f"  - undersized-room events (should be 0)={metrics.rooms_events_exceeding_capacity_count}\n"
-        f"  - oversized-room events={metrics.rooms_events_much_larger_than_students_count}/{metrics.rooms_events_much_larger_than_students_opportunities}={metrics.rooms_events_much_larger_than_students_ratio:.3f}\n"
-        f"  - space inefficiency: wasted seats x hours = {metrics.rooms_wasted_seat_hours:.1f}"
+        _fmt_coverage(
+            "oversized-room events",
+            metrics.rooms_events_much_larger_than_students_count,
+            metrics.rooms_events_much_larger_than_students_possible,
+            metrics.rooms_events_much_larger_than_students_total,
+            "events",
+            higher_better=False,
+        )
     )
-    print(
-        "- room continuity:\n"
-        f"  - lec->tut same room (higher is better)={metrics.room_continuity_lec_tut_same_room_count}/{metrics.room_continuity_lec_tut_same_room_opportunities}={metrics.room_continuity_lec_tut_same_room_ratio:.3f}\n"
-        f"  - instructor room swaps on consecutive slots (lower is better)={metrics.room_continuity_instructor_room_swaps_consecutive}/{metrics.room_continuity_instructor_room_swaps_consecutive_opportunities}"
-        f"={metrics.room_continuity_instructor_room_swaps_consecutive_ratio:.3f}"
-    )
+    print(f"    wasted seats x hours = {metrics.rooms_wasted_seat_hours:.1f}")
     print(
         "- global hatred:\n"
         f"  - saturday events={metrics.hatred_global_saturday_event_count}\n"
-        f"  - sunday events={metrics.hatred_global_sunday_event_count}\n"
-        f"  - late events (>18:00) all={metrics.hatred_global_late_events_count}\n"
-        f"      - late lec (>18:00)={metrics.hatred_global_late_events_lec_count}\n"
-        f"      - late tut (>18:00)={metrics.hatred_global_late_events_tut_count}\n"
-        f"      - late lab/class (>18:00)={metrics.hatred_global_late_events_lab_or_class_count}"
+        f"  - late events (>18:00): all={metrics.hatred_global_late_events_count}, "
+        f"lec={metrics.hatred_global_late_events_lec_count}, "
+        f"tut={metrics.hatred_global_late_events_tut_count}, "
+        f"lab/class={metrics.hatred_global_late_events_lab_or_class_count}"
     )
     print(
         "- student hatred:\n"
-        f"  - bad days when more than {BAD_DAY_EVENT_THRESHOLD} events={metrics.hatred_student_bad_days_events_total}\n"
-        f"      - groups with >=1 bad_day by events={metrics.hatred_student_groups_with_bad_days_events}\n"
-        f"  - bad days when more than {BAD_DAY_DISTINCT_SUBJECTS_THRESHOLD} distinct subjects={metrics.hatred_student_bad_days_distinct_total}\n"
-        f"      - groups with >=1 bad_day by distinct subjects={metrics.hatred_student_groups_with_bad_days_distinct}\n"
-        f"  - total excess active days (groups)={metrics.hatred_student_total_active_days_excess_groups}\n"
-        f"      - groups with >=1 excess day={metrics.hatred_student_groups_with_excess_day_count}"
+        f"  - high-load days (> {BAD_DAY_EVENT_THRESHOLD} events): days={metrics.hatred_student_bad_days_events_total}, groups affected={metrics.hatred_student_groups_with_bad_days_events}\n"
+        f"  - high-variety days (> {BAD_DAY_DISTINCT_SUBJECTS_THRESHOLD} distinct subjects): days={metrics.hatred_student_bad_days_distinct_total}, groups affected={metrics.hatred_student_groups_with_bad_days_distinct}\n"
+        f"  - excess active days: days={metrics.hatred_student_total_active_days_excess_groups}, groups affected={metrics.hatred_student_groups_with_excess_day_count}"
     )
     print(
         "- instructor hatred:\n"
-        f"  - total excess active days (instructors)={metrics.hatred_instructor_total_active_days_excess}\n"
-        f"      - instructors with >=1 excess day={metrics.hatred_instructor_with_excess_day_count}"
+        f"  - high-load days (> {INSTRUCTOR_DAILY_EVENT_THRESHOLD} events): days={metrics.hatred_instructor_bad_days_events_total}, instructors affected={metrics.hatred_instructor_with_bad_days_events_count}\n"
+        f"  - excess active days: days={metrics.hatred_instructor_total_active_days_excess}, instructors affected={metrics.hatred_instructor_with_excess_day_count}\n"
+        f"  - room swaps on consecutive slots: {metrics.room_continuity_instructor_room_swaps_consecutive} from {metrics.room_continuity_instructor_room_swaps_consecutive_possible} possible, "
+        f"{metrics.room_continuity_instructor_room_swaps_consecutive_ratio * 100.0:.1f}% incidence"
     )
     print("======\n")
 
