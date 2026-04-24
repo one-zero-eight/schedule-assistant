@@ -173,6 +173,8 @@ class ScheduleMetrics:
     quality_tutorials_before_lecture_count: int
     rooms_events_exceeding_capacity_count: int
     rooms_events_much_larger_than_students_count: int
+    rooms_events_much_larger_than_students_opportunities: int
+    rooms_events_much_larger_than_students_ratio: float
     rooms_overflow_students_total: int
     rooms_wasted_seat_hours: float
     room_continuity_lec_tut_same_room_opportunities: int
@@ -521,6 +523,7 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
     total_weighted_group_hours = 0.0
     events_exceeding_room_capacity_count = 0
     events_with_room_much_larger_than_students_count = 0
+    events_with_oversize_avoidance_opportunity_count = 0
     total_capacity_overflow_students = 0
     wasted_seat_hours = 0.0
 
@@ -554,10 +557,23 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
 
         feasible_for_full = any(cap >= expected_students for cap in room_caps.values())
         required_capacity = max(1, expected_students if feasible_for_full else math.ceil(expected_students * 0.9))
+        is_oversize_here = False
         if room_capacity > required_capacity:
             oversize_pct = ((room_capacity - required_capacity) * 100) // max(1, required_capacity)
             if oversize_pct > ROOM_OVERSIZE_PCT_THRESHOLD:
                 events_with_room_much_larger_than_students_count += 1
+                is_oversize_here = True
+        had_non_oversize_option = any(
+            cap >= required_capacity
+            and ((cap - required_capacity) * 100) // max(1, required_capacity) <= ROOM_OVERSIZE_PCT_THRESHOLD
+            for cap in room_caps.values()
+        )
+        if had_non_oversize_option:
+            events_with_oversize_avoidance_opportunity_count += 1
+        elif is_oversize_here:
+            # Meeting was forced into oversize — no better option existed, so
+            # it's not an "avoidance opportunity"; excluded from denominator.
+            pass
 
     core_course_idx = {i for i, c in enumerate(cfg.courses) if "core_course" in {str(t).lower() for t in c.course_tags}}
     core_events_per_group_day: dict[tuple[str, str], int] = defaultdict(int)
@@ -655,6 +671,12 @@ def calculate_schedule_metrics(result: SolveResult, cfg: ScheduleConfig) -> Sche
         quality_tutorials_before_lecture_count=_count_tag_before_tag(events, cfg, "tut", "lec"),
         rooms_events_exceeding_capacity_count=events_exceeding_room_capacity_count,
         rooms_events_much_larger_than_students_count=events_with_room_much_larger_than_students_count,
+        rooms_events_much_larger_than_students_opportunities=events_with_oversize_avoidance_opportunity_count,
+        rooms_events_much_larger_than_students_ratio=(
+            events_with_room_much_larger_than_students_count / events_with_oversize_avoidance_opportunity_count
+            if events_with_oversize_avoidance_opportunity_count > 0
+            else 0.0
+        ),
         rooms_overflow_students_total=total_capacity_overflow_students,
         rooms_wasted_seat_hours=wasted_seat_hours,
         room_continuity_lec_tut_same_room_opportunities=lec_tut_same_room_opportunities,
@@ -772,10 +794,9 @@ def _print_human_report(metrics: ScheduleMetrics) -> None:
     )
     print(
         "- room capacity violations (lower is better):\n"
-        f"  - undersized-room events={metrics.rooms_events_exceeding_capacity_count}\n"
-        f"  - oversized-room events={metrics.rooms_events_much_larger_than_students_count}\n"
-        f"  - overflow students={metrics.rooms_overflow_students_total}\n"
-        f"  - space inefficiency: wasted seats x hours={metrics.rooms_wasted_seat_hours:.1f}"
+        f"  - undersized-room events (should be 0)={metrics.rooms_events_exceeding_capacity_count}\n"
+        f"  - oversized-room events={metrics.rooms_events_much_larger_than_students_count}/{metrics.rooms_events_much_larger_than_students_opportunities}={metrics.rooms_events_much_larger_than_students_ratio:.3f}\n"
+        f"  - space inefficiency: wasted seats x hours = {metrics.rooms_wasted_seat_hours:.1f}"
     )
     print(
         "- room continuity:\n"
@@ -788,23 +809,23 @@ def _print_human_report(metrics: ScheduleMetrics) -> None:
         f"  - saturday events={metrics.hatred_global_saturday_event_count}\n"
         f"  - sunday events={metrics.hatred_global_sunday_event_count}\n"
         f"  - late events (>18:00) all={metrics.hatred_global_late_events_count}\n"
-        f"  - late lec (>18:00)={metrics.hatred_global_late_events_lec_count}\n"
-        f"  - late tut (>18:00)={metrics.hatred_global_late_events_tut_count}\n"
-        f"  - late lab/class (>18:00)={metrics.hatred_global_late_events_lab_or_class_count}"
+        f"      - late lec (>18:00)={metrics.hatred_global_late_events_lec_count}\n"
+        f"      - late tut (>18:00)={metrics.hatred_global_late_events_tut_count}\n"
+        f"      - late lab/class (>18:00)={metrics.hatred_global_late_events_lab_or_class_count}"
     )
     print(
         "- student hatred:\n"
         f"  - bad days when more than {BAD_DAY_EVENT_THRESHOLD} events={metrics.hatred_student_bad_days_events_total}\n"
-        f"  - groups with >=1 bad_day by events={metrics.hatred_student_groups_with_bad_days_events}\n"
+        f"      - groups with >=1 bad_day by events={metrics.hatred_student_groups_with_bad_days_events}\n"
         f"  - bad days when more than {BAD_DAY_DISTINCT_SUBJECTS_THRESHOLD} distinct subjects={metrics.hatred_student_bad_days_distinct_total}\n"
-        f"  - groups with >=1 bad_day by distinct subjects={metrics.hatred_student_groups_with_bad_days_distinct}\n"
+        f"      - groups with >=1 bad_day by distinct subjects={metrics.hatred_student_groups_with_bad_days_distinct}\n"
         f"  - total excess active days (groups)={metrics.hatred_student_total_active_days_excess_groups}\n"
-        f"  - groups with >=1 excess day={metrics.hatred_student_groups_with_excess_day_count}"
+        f"      - groups with >=1 excess day={metrics.hatred_student_groups_with_excess_day_count}"
     )
     print(
         "- instructor hatred:\n"
         f"  - total excess active days (instructors)={metrics.hatred_instructor_total_active_days_excess}\n"
-        f"  - instructors with >=1 excess day={metrics.hatred_instructor_with_excess_day_count}"
+        f"      - instructors with >=1 excess day={metrics.hatred_instructor_with_excess_day_count}"
     )
     print("======\n")
 
